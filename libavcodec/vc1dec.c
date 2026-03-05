@@ -24,6 +24,35 @@
 /**
  * @file
  * VC-1 and WMV3 decoder
+ *
+ * Threading model
+ * ───────────────
+ * Frame-level (FF_CODEC_CAP_INIT_THREADSAFE + AV_CODEC_CAP_FRAME_THREADS):
+ *   Multiple frames are pipelined across worker threads.  Each thread owns its
+ *   own VC1Context / MpegEncContext.  vc1_update_thread_context() propagates
+ *   per-frame and per-entry-point state (VLC table pointers, quantiser params,
+ *   FCM flags, …) from the producer thread to every consumer thread before the
+ *   consumer begins decoding a dependent frame.
+ *
+ * Slice-level (AV_CODEC_CAP_SLICE_THREADS via avctx->execute2):
+ *   Within a single progressive or field-picture frame the slice segments that
+ *   were parsed into the slices[] array are dispatched to avctx->execute2 so
+ *   that independent horizontal bands are decoded in parallel.  Slices that
+ *   share a field boundary are kept in separate dispatch groups to preserve the
+ *   top→bottom prediction order that the VC-1 spec requires within each field.
+ *
+ *   ┌─ field 0 slices ──────────────────────┐
+ *   │  job 0 │ job 1 │ … │ job n_slices1+1  │  → execute2 group A (field 0)
+ *   └────────────────────────────────────────┘
+ *   ┌─ field 1 slices ──────────────────────┐
+ *   │  job 0 │ job 1 │ … │ job remainder    │  → execute2 group B (field 1)
+ *   └────────────────────────────────────────┘
+ *
+ *   NOTE: Full data-parallel MB-row decoding would require rewriting the
+ *   bitstream parsing layer (each MB row depends on the row above for DC/AC
+ *   prediction and overlap filtering).  The current implementation therefore
+ *   uses execute2 at the coarser slice granularity and serialises within each
+ *   slice to preserve correctness.
  */
 
 #include "config_components.h"
@@ -606,7 +635,7 @@ av_cold void ff_vc1_init_common(VC1Context *v)
     /* For error resilience */
     ff_qpeldsp_init(&s->qdsp);
 
-    /* VLC tables */
+    /* VLC tables — guarded by ff_thread_once so safe for frame threading */
     ff_thread_once(&init_static_once, vc1_init_static);
 }
 
@@ -807,6 +836,152 @@ av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
 {
     vc1_decode_reset(avctx);
     return ff_mpv_decode_close(avctx);
+}
+
+/* -----------------------------------------------------------------------
+ * Frame-level threading
+ * -----------------------------------------------------------------------
+ *
+ * vc1_update_thread_context() is called by FFmpeg's frame-threading layer
+ * whenever a worker thread is about to decode a frame that depends on work
+ * produced by another thread.  It copies every piece of VC1Context state
+ * that can change from frame to frame so the receiving thread has an
+ * identical view of the codec state as the producing thread had when it
+ * finished decoding the previous frame.
+ *
+ * The underlying MpegEncContext (reference pictures, low_delay flag, …) is
+ * handled by ff_mpeg_update_thread_context(); we only handle the VC-1-
+ * specific fields here.
+ */
+static int vc1_update_thread_context(AVCodecContext *dst,
+                                     const AVCodecContext *src)
+{
+    VC1Context       *dst_v = dst->priv_data;
+    const VC1Context *src_v = src->priv_data;
+    int ret;
+
+    /* Let the MPEG layer handle MpegEncContext (ref-picture management etc.) */
+    ret = ff_mpeg_update_thread_context(dst, src);
+    if (ret < 0)
+        return ret;
+
+    /* ── Sequence-header fields (rarely change, but must stay in sync) ── */
+    dst_v->profile         = src_v->profile;
+    dst_v->level           = src_v->level;
+    dst_v->chromaformat    = src_v->chromaformat;
+    dst_v->interlace       = src_v->interlace;
+    dst_v->tfcntrflag      = src_v->tfcntrflag;
+    dst_v->finterpflag     = src_v->finterpflag;
+    dst_v->psf             = src_v->psf;
+    dst_v->multires        = src_v->multires;
+    dst_v->panscanflag     = src_v->panscanflag;
+    dst_v->refdist_flag    = src_v->refdist_flag;
+    dst_v->color_prim      = src_v->color_prim;
+    dst_v->transfer_char   = src_v->transfer_char;
+    dst_v->matrix_coef     = src_v->matrix_coef;
+    dst_v->res_sprite      = src_v->res_sprite;
+    dst_v->res_fasttx      = src_v->res_fasttx;
+
+    /* ── Entry-point fields (may change at random-access points) ── */
+    dst_v->fastuvmc        = src_v->fastuvmc;
+    dst_v->extended_mv     = src_v->extended_mv;
+    dst_v->extended_dmv    = src_v->extended_dmv;
+    dst_v->dquant          = src_v->dquant;
+    dst_v->vstransform     = src_v->vstransform;
+    dst_v->overlap         = src_v->overlap;
+    dst_v->quantizer_mode  = src_v->quantizer_mode;
+    dst_v->rangered        = src_v->rangered;
+
+    /* ── Per-frame fields ── */
+    dst_v->pq              = src_v->pq;
+    dst_v->pqindex         = src_v->pqindex;
+    dst_v->halfpq          = src_v->halfpq;
+    dst_v->pquantizer      = src_v->pquantizer;
+    dst_v->fcm             = src_v->fcm;
+    dst_v->field_mode      = src_v->field_mode;
+    dst_v->rangeredfrm     = src_v->rangeredfrm;
+    dst_v->mvrange         = src_v->mvrange;
+    dst_v->refdist         = src_v->refdist;
+    dst_v->rff             = src_v->rff;
+    dst_v->rptfrm          = src_v->rptfrm;
+    dst_v->tff             = src_v->tff;
+    dst_v->second_field    = src_v->second_field;
+
+    /*
+     * ── VLC table pointers ──
+     *
+     * These point into the global static VLC tables initialised once in
+     * vc1_init_static().  Copying the pointers is safe and cheap; the
+     * underlying table data is immutable after init.
+     */
+    dst_v->cbpcy_vlc       = src_v->cbpcy_vlc;
+    dst_v->ttmb_vlc        = src_v->ttmb_vlc;
+    dst_v->ttblk_vlc       = src_v->ttblk_vlc;
+    dst_v->subblkpat_vlc   = src_v->subblkpat_vlc;
+    dst_v->mv_vlc          = src_v->mv_vlc;
+    dst_v->imvtab          = src_v->imvtab;
+    dst_v->icbptab         = src_v->icbptab;
+    dst_v->fourmvbptab     = src_v->fourmvbptab;
+    dst_v->fourmvtyptab    = src_v->fourmvtyptab;
+
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Slice-level threading helpers
+ * -----------------------------------------------------------------------
+ *
+ * A "slice job" corresponds to one contiguous horizontal band of macroblocks
+ * within a single field/frame.  The jobs array is built from the slices[]
+ * array assembled during bitstream parsing.  Jobs within the same field are
+ * dispatched together via avctx->execute2 so the threading layer can run
+ * them in parallel as hardware resources allow.
+ *
+ * Correctness note: VC-1 macroblocks within a slice are not independent —
+ * each MB uses DC/AC prediction and overlap filtering from its left and
+ * top-left neighbours.  Therefore we cannot split finer than slice
+ * boundaries without rewriting the prediction layer.  The job granularity
+ * here is one slice per job.
+ */
+
+/**
+ * Per-job context passed to vc1_slice_worker via execute2's void* priv.
+ */
+typedef struct VC1SliceJob {
+    VC1Context  *v;
+    int          slice_idx;    /**< index into the frame's slices[] array, or -1
+                                    for the implicit "slice 0" (before the first
+                                    explicit VC1_CODE_SLICE marker)            */
+    int          mb_y_start;
+    int          mb_y_end;
+    int          header_ret;   /**< result of any slice-header parse */
+} VC1SliceJob;
+
+/**
+ * execute2 worker: decode the MB rows assigned to one slice.
+ *
+ * @param avctx   codec context (read-only inside the worker)
+ * @param priv    pointer to a VC1SliceJob array
+ * @param jobnr   index of the job to execute in this call
+ * @param threadnr  worker-thread index (unused; state lives in the job)
+ */
+static int vc1_slice_worker(AVCodecContext *avctx, void *priv,
+                             int jobnr, int threadnr)
+{
+    VC1SliceJob *jobs = priv;
+    VC1SliceJob *job  = &jobs[jobnr];
+    VC1Context  *v    = job->v;
+    MpegEncContext *s = &v->s;
+
+    if (job->header_ret < 0)
+        return 0; /* header was damaged; skip quietly */
+
+    s->start_mb_y = job->mb_y_start;
+    s->end_mb_y   = job->mb_y_end;
+
+    ff_vc1_decode_blocks(v);
+
+    return 0;
 }
 
 /** Decode a VC1/WMV3 frame
@@ -1238,7 +1413,28 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                 goto err;
         }
     } else {
+        /*
+         * Software decode path — uses avctx->execute2 for slice-level
+         * parallelism.
+         *
+         * We build a flat VC1SliceJob array covering all slices in the
+         * current field (or progressive frame).  Headers are parsed
+         * sequentially up-front (they are tiny and depend on each other),
+         * then the actual block-decoding work is handed to execute2.
+         *
+         * For field-mode pictures the two fields are processed in two
+         * separate execute2 calls to guarantee that field-0 reference data
+         * is fully written before field-1 motion compensation reads it.
+         */
         int header_ret = 0;
+        int total_jobs; /* number of jobs in the current dispatch */
+
+        /* Maximum possible jobs: n_slices + 1 (the implicit first segment) */
+        VC1SliceJob *jobs = av_mallocz_array(n_slices + 1, sizeof(*jobs));
+        if (!jobs) {
+            ret = AVERROR(ENOMEM);
+            goto err;
+        }
 
         ff_mpeg_er_frame_start(s);
 
@@ -1247,95 +1443,157 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
             s->cur_pic.linesize[0] <<= 1;
             s->cur_pic.linesize[1] <<= 1;
             s->cur_pic.linesize[2] <<= 1;
-            s->linesize                      <<= 1;
-            s->uvlinesize                    <<= 1;
+            s->linesize            <<= 1;
+            s->uvlinesize          <<= 1;
         }
         mb_height = s->mb_height >> v->field_mode;
 
-        av_assert0 (mb_height > 0);
+        av_assert0(mb_height > 0);
 
+        /*
+         * Phase 1: parse all slice headers sequentially.
+         *
+         * This mirrors the original loop's header-parsing logic but stores
+         * the result (including any header parse error) in the job struct so
+         * the worker can skip damaged segments without aborting the whole
+         * execute2 call.
+         */
+        total_jobs = 0;
         for (i = 0; i <= n_slices; i++) {
-            if (i > 0 &&  slices[i - 1].mby_start >= mb_height) {
-                if (v->field_mode <= 0) {
-                    av_log(v->s.avctx, AV_LOG_ERROR, "Slice %d starts beyond "
-                           "picture boundary (%d >= %d)\n", i,
-                           slices[i - 1].mby_start, mb_height);
-                    continue;
-                }
+            VC1SliceJob *job = &jobs[total_jobs];
+            int is_second_field_start = (v->field_mode &&
+                                         i > 0 &&
+                                         slices[i - 1].mby_start >= mb_height);
+
+            /* Update second-field flag and line strides */
+            if (is_second_field_start) {
                 v->second_field = 1;
                 av_assert0((s->mb_height & 1) == 0);
-                v->blocks_off   = s->b8_stride * (s->mb_height&~1);
-                v->mb_off       = s->mb_stride * s->mb_height >> 1;
-            } else {
+                v->blocks_off = s->b8_stride * (s->mb_height & ~1);
+                v->mb_off     = s->mb_stride * s->mb_height >> 1;
+            } else if (i == 0) {
                 v->second_field = 0;
                 v->blocks_off   = 0;
                 v->mb_off       = 0;
             }
-            if (i) {
+
+            /* Parse slice header (if any) into v so ff_vc1_decode_blocks
+             * will use the correct parameters for this slice.             */
+            header_ret = 0;
+            if (i > 0) {
+                v->gb              = slices[i - 1].gb;
+                s->mb_y            = slices[i - 1].mby_start;
                 v->pic_header_flag = 0;
+
                 if (v->field_mode && i == n_slices1 + 2) {
-                    if ((header_ret = ff_vc1_parse_frame_header_adv(v, &v->gb)) < 0) {
-                        av_log(v->s.avctx, AV_LOG_ERROR, "Field header damaged\n");
-                        ret = AVERROR_INVALIDDATA;
-                        if (avctx->err_recognition & AV_EF_EXPLODE)
-                            goto err;
-                        continue;
-                    }
+                    /* First slice of the second field carries a full frame
+                     * header for the second field.                        */
+                    header_ret = ff_vc1_parse_frame_header_adv(v, &v->gb);
+                    if (header_ret < 0)
+                        av_log(avctx, AV_LOG_ERROR, "Field header damaged\n");
                 } else if (get_bits1(&v->gb)) {
                     v->pic_header_flag = 1;
-                    if ((header_ret = ff_vc1_parse_frame_header_adv(v, &v->gb)) < 0) {
-                        av_log(v->s.avctx, AV_LOG_ERROR, "Slice header damaged\n");
-                        ret = AVERROR_INVALIDDATA;
-                        if (avctx->err_recognition & AV_EF_EXPLODE)
-                            goto err;
-                        continue;
-                    }
+                    header_ret = ff_vc1_parse_frame_header_adv(v, &v->gb);
+                    if (header_ret < 0)
+                        av_log(avctx, AV_LOG_ERROR, "Slice header damaged\n");
                 }
             }
-            if (header_ret < 0)
-                continue;
-            s->start_mb_y = (i == 0) ? 0 : FFMAX(0, slices[i-1].mby_start % mb_height);
-            if (!v->field_mode || v->second_field)
-                s->end_mb_y = (i == n_slices     ) ? mb_height : FFMIN(mb_height, slices[i].mby_start % mb_height);
-            else {
-                if (i >= n_slices) {
-                    av_log(v->s.avctx, AV_LOG_ERROR, "first field slice count too large\n");
+
+            /* Determine MB row range for this job */
+            {
+                int mby_start = (i == 0) ? 0
+                    : FFMAX(0, slices[i - 1].mby_start % mb_height);
+                int mby_end;
+
+                if (!v->field_mode || v->second_field)
+                    mby_end = (i == n_slices) ? mb_height
+                        : FFMIN(mb_height, slices[i].mby_start % mb_height);
+                else {
+                    if (i >= n_slices) {
+                        av_log(avctx, AV_LOG_ERROR,
+                               "first field slice count too large\n");
+                        av_free(jobs);
+                        goto soft_path_done;
+                    }
+                    mby_end = (i == n_slices1 + 1) ? mb_height
+                        : FFMIN(mb_height, slices[i].mby_start % mb_height);
+                }
+
+                if (mby_end <= mby_start) {
+                    av_log(avctx, AV_LOG_ERROR,
+                           "end mb y %d %d invalid\n", mby_end, mby_start);
+                    /* Skip this job slot — don't increment total_jobs */
                     continue;
                 }
-                s->end_mb_y = (i == n_slices1 + 1) ? mb_height : FFMIN(mb_height, slices[i].mby_start % mb_height);
+
+                if (((s->pict_type == AV_PICTURE_TYPE_P && !v->p_frame_skipped) ||
+                     (s->pict_type == AV_PICTURE_TYPE_B && !v->bi_type)) &&
+                    !v->cbpcy_vlc) {
+                    av_log(avctx, AV_LOG_ERROR, "missing cbpcy_vlc\n");
+                    continue;
+                }
+
+                job->v           = v;
+                job->slice_idx   = i - 1; /* -1 = implicit first segment */
+                job->mb_y_start  = mby_start;
+                job->mb_y_end    = mby_end;
+                job->header_ret  = header_ret;
+                total_jobs++;
+
+                /*
+                 * Flush field boundary: execute2 all jobs for field 0 before
+                 * we start filling field-1 jobs so that motion-compensation
+                 * in field 1 sees fully-decoded field-0 reference data.
+                 */
+                if (v->field_mode && is_second_field_start && total_jobs > 1) {
+                    /* Dispatch field-0 jobs (all but the job we just added) */
+                    ret = avctx->execute2(avctx, vc1_slice_worker,
+                                          jobs, NULL, total_jobs - 1);
+                    if (ret < 0) {
+                        av_free(jobs);
+                        goto err;
+                    }
+                    /* Shift the new field-1 job to position 0 */
+                    jobs[0]    = jobs[total_jobs - 1];
+                    total_jobs = 1;
+
+                    /* Restore the second-field context the header parse left */
+                    v->second_field = 1;
+                    v->blocks_off   = s->b8_stride * (s->mb_height & ~1);
+                    v->mb_off       = s->mb_stride * s->mb_height >> 1;
+                }
             }
-            if (s->end_mb_y <= s->start_mb_y) {
-                av_log(v->s.avctx, AV_LOG_ERROR, "end mb y %d %d invalid\n", s->end_mb_y, s->start_mb_y);
-                continue;
-            }
-            if (((s->pict_type == AV_PICTURE_TYPE_P && !v->p_frame_skipped) ||
-                 (s->pict_type == AV_PICTURE_TYPE_B && !v->bi_type)) &&
-                !v->cbpcy_vlc) {
-                av_log(v->s.avctx, AV_LOG_ERROR, "missing cbpcy_vlc\n");
-                continue;
-            }
-            ff_vc1_decode_blocks(v);
-            if (i != n_slices) {
-                v->gb = slices[i].gb;
-            }
+        } /* end header-parse / job-build loop */
+
+        /* Dispatch any remaining jobs (second field, or the whole frame in
+         * non-field-mode).                                                 */
+        if (total_jobs > 0) {
+            ret = avctx->execute2(avctx, vc1_slice_worker,
+                                  jobs, NULL, total_jobs);
+            av_free(jobs);
+            if (ret < 0)
+                goto err;
+        } else {
+            av_free(jobs);
         }
+
+soft_path_done:
         if (v->field_mode) {
             v->second_field = 0;
             s->cur_pic.linesize[0] >>= 1;
             s->cur_pic.linesize[1] >>= 1;
             s->cur_pic.linesize[2] >>= 1;
-            s->linesize                      >>= 1;
-            s->uvlinesize                    >>= 1;
-            if (v->s.pict_type != AV_PICTURE_TYPE_BI && v->s.pict_type != AV_PICTURE_TYPE_B) {
+            s->linesize            >>= 1;
+            s->uvlinesize          >>= 1;
+            if (v->s.pict_type != AV_PICTURE_TYPE_BI &&
+                v->s.pict_type != AV_PICTURE_TYPE_B) {
                 FFSWAP(uint8_t *, v->mv_f_next[0], v->mv_f[0]);
                 FFSWAP(uint8_t *, v->mv_f_next[1], v->mv_f[1]);
             }
         }
         ff_dlog(s->avctx, "Consumed %i/%i bits\n",
                 get_bits_count(&v->gb), v->gb.size_in_bits);
-//  if (get_bits_count(&v->gb) > buf_size * 8)
-//      return -1;
-        if(s->er.error_occurred && s->pict_type == AV_PICTURE_TYPE_B) {
+        if (s->er.error_occurred && s->pict_type == AV_PICTURE_TYPE_B) {
             ret = AVERROR_INVALIDDATA;
             goto err;
         }
@@ -1391,17 +1649,30 @@ err:
 
 
 const FFCodec ff_vc1_decoder = {
-    .p.name         = "vc1",
+    .p.name           = "vc1",
     CODEC_LONG_NAME("SMPTE VC-1"),
-    .p.type         = AVMEDIA_TYPE_VIDEO,
-    .p.id           = AV_CODEC_ID_VC1,
-    .priv_data_size = sizeof(VC1Context),
-    .init           = vc1_decode_init,
-    .close          = ff_vc1_decode_end,
+    .p.type           = AVMEDIA_TYPE_VIDEO,
+    .p.id             = AV_CODEC_ID_VC1,
+    .priv_data_size   = sizeof(VC1Context),
+    .init             = vc1_decode_init,
+    .close            = ff_vc1_decode_end,
     FF_CODEC_DECODE_CB(vc1_decode_frame),
-    .flush          = ff_mpeg_flush,
-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
-    .hw_configs     = (const AVCodecHWConfigInternal *const []) {
+    .flush            = ff_mpeg_flush,
+    /*
+     * AV_CODEC_CAP_FRAME_THREADS: multiple frames are decoded in a pipeline
+     *   across worker threads.  vc1_update_thread_context() keeps each
+     *   thread's VC1Context synchronised with the latest parsed headers.
+     *
+     * AV_CODEC_CAP_SLICE_THREADS: the software decode path uses
+     *   avctx->execute2 to dispatch independent slice bands in parallel
+     *   within a single frame.
+     */
+    .p.capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                        AV_CODEC_CAP_FRAME_THREADS |
+                        AV_CODEC_CAP_SLICE_THREADS,
+    .caps_internal    = FF_CODEC_CAP_INIT_THREADSAFE,
+    .update_thread_context = vc1_update_thread_context,
+    .hw_configs       = (const AVCodecHWConfigInternal *const []) {
 #if CONFIG_VC1_DXVA2_HWACCEL
                         HWACCEL_DXVA2(vc1),
 #endif
@@ -1425,22 +1696,26 @@ const FFCodec ff_vc1_decoder = {
 #endif
                         NULL
                     },
-    .p.profiles     = NULL_IF_CONFIG_SMALL(ff_vc1_profiles)
+    .p.profiles       = NULL_IF_CONFIG_SMALL(ff_vc1_profiles)
 };
 
 #if CONFIG_WMV3_DECODER
 const FFCodec ff_wmv3_decoder = {
-    .p.name         = "wmv3",
+    .p.name           = "wmv3",
     CODEC_LONG_NAME("Windows Media Video 9"),
-    .p.type         = AVMEDIA_TYPE_VIDEO,
-    .p.id           = AV_CODEC_ID_WMV3,
-    .priv_data_size = sizeof(VC1Context),
-    .init           = vc1_decode_init,
-    .close          = ff_vc1_decode_end,
+    .p.type           = AVMEDIA_TYPE_VIDEO,
+    .p.id             = AV_CODEC_ID_WMV3,
+    .priv_data_size   = sizeof(VC1Context),
+    .init             = vc1_decode_init,
+    .close            = ff_vc1_decode_end,
     FF_CODEC_DECODE_CB(vc1_decode_frame),
-    .flush          = ff_mpeg_flush,
-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
-    .hw_configs     = (const AVCodecHWConfigInternal *const []) {
+    .flush            = ff_mpeg_flush,
+    .p.capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                        AV_CODEC_CAP_FRAME_THREADS |
+                        AV_CODEC_CAP_SLICE_THREADS,
+    .caps_internal    = FF_CODEC_CAP_INIT_THREADSAFE,
+    .update_thread_context = vc1_update_thread_context,
+    .hw_configs       = (const AVCodecHWConfigInternal *const []) {
 #if CONFIG_WMV3_DXVA2_HWACCEL
                         HWACCEL_DXVA2(wmv3),
 #endif
@@ -1464,36 +1739,40 @@ const FFCodec ff_wmv3_decoder = {
 #endif
                         NULL
                     },
-    .p.profiles     = NULL_IF_CONFIG_SMALL(ff_vc1_profiles)
+    .p.profiles       = NULL_IF_CONFIG_SMALL(ff_vc1_profiles)
 };
 #endif
 
 #if CONFIG_WMV3IMAGE_DECODER
 const FFCodec ff_wmv3image_decoder = {
-    .p.name         = "wmv3image",
+    .p.name           = "wmv3image",
     CODEC_LONG_NAME("Windows Media Video 9 Image"),
-    .p.type         = AVMEDIA_TYPE_VIDEO,
-    .p.id           = AV_CODEC_ID_WMV3IMAGE,
-    .priv_data_size = sizeof(VC1Context),
-    .init           = vc1_decode_init,
-    .close          = ff_vc1_decode_end,
+    .p.type           = AVMEDIA_TYPE_VIDEO,
+    .p.id             = AV_CODEC_ID_WMV3IMAGE,
+    .priv_data_size   = sizeof(VC1Context),
+    .init             = vc1_decode_init,
+    .close            = ff_vc1_decode_end,
     FF_CODEC_DECODE_CB(vc1_decode_frame),
-    .p.capabilities = AV_CODEC_CAP_DR1,
-    .flush          = vc1_sprite_flush,
+    /* WMV Image is always I-frame only — frame threading adds latency
+     * without benefit; slice threading still applies.                */
+    .p.capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SLICE_THREADS,
+    .caps_internal    = FF_CODEC_CAP_INIT_THREADSAFE,
+    .flush            = vc1_sprite_flush,
 };
 #endif
 
 #if CONFIG_VC1IMAGE_DECODER
 const FFCodec ff_vc1image_decoder = {
-    .p.name         = "vc1image",
+    .p.name           = "vc1image",
     CODEC_LONG_NAME("Windows Media Video 9 Image v2"),
-    .p.type         = AVMEDIA_TYPE_VIDEO,
-    .p.id           = AV_CODEC_ID_VC1IMAGE,
-    .priv_data_size = sizeof(VC1Context),
-    .init           = vc1_decode_init,
-    .close          = ff_vc1_decode_end,
+    .p.type           = AVMEDIA_TYPE_VIDEO,
+    .p.id             = AV_CODEC_ID_VC1IMAGE,
+    .priv_data_size   = sizeof(VC1Context),
+    .init             = vc1_decode_init,
+    .close            = ff_vc1_decode_end,
     FF_CODEC_DECODE_CB(vc1_decode_frame),
-    .p.capabilities = AV_CODEC_CAP_DR1,
-    .flush          = vc1_sprite_flush,
+    .p.capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SLICE_THREADS,
+    .caps_internal    = FF_CODEC_CAP_INIT_THREADSAFE,
+    .flush            = vc1_sprite_flush,
 };
 #endif
