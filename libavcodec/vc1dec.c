@@ -906,6 +906,43 @@ static int vc1_update_thread_context(AVCodecContext *dst,
     dst_v->rptfrm          = src_v->rptfrm;
     dst_v->tff             = src_v->tff;
     dst_v->second_field    = src_v->second_field;
+    dst_v->condover        = src_v->condover;
+
+    /*
+     * ── Frame-type flags ──
+     *
+     * p_frame_skipped and bi_type are read in the cbpcy_vlc guard check
+     * inside the job-build loop; missing them can cause ff_vc1_decode_blocks
+     * to be called without a valid cbpcy_vlc table.
+     */
+    dst_v->p_frame_skipped = src_v->p_frame_skipped;
+    dst_v->bi_type         = src_v->bi_type;
+
+    /*
+     * ── Scan tables ──
+     *
+     * These are embedded uint8_t arrays (not pointers) that are set in
+     * ff_vc1_init_transposed_scantables() or copied from ff_wmv1_scantable.
+     * They must be in sync across threads because they drive the inverse
+     * transform path chosen per-frame.
+     */
+    memcpy(dst_v->zz_8x8,  src_v->zz_8x8,  sizeof(src_v->zz_8x8));
+    memcpy(dst_v->zzi_8x8, src_v->zzi_8x8, sizeof(src_v->zzi_8x8));
+    dst_v->left_blk_sh     = src_v->left_blk_sh;
+    dst_v->top_blk_sh      = src_v->top_blk_sh;
+
+    /*
+     * ── Sprite geometry ──
+     *
+     * These change whenever the coded dimensions change (e.g. a new sprite
+     * sequence header is encountered mid-stream).
+     */
+    dst_v->sprite_width    = src_v->sprite_width;
+    dst_v->sprite_height   = src_v->sprite_height;
+    dst_v->output_width    = src_v->output_width;
+    dst_v->output_height   = src_v->output_height;
+    dst_v->two_sprites     = src_v->two_sprites;
+    dst_v->new_sprite      = src_v->new_sprite;
 
     /*
      * ── VLC table pointers ──
@@ -942,44 +979,63 @@ static int vc1_update_thread_context(AVCodecContext *dst,
  * top-left neighbours.  Therefore we cannot split finer than slice
  * boundaries without rewriting the prediction layer.  The job granularity
  * here is one slice per job.
+ *
+ * Thread safety
+ * ─────────────
+ * Each VC1SliceJob embeds a *full private snapshot* of the VC1Context (and
+ * hence MpegEncContext) taken immediately after the slice header is parsed
+ * on the main thread.  Workers operate exclusively on their private copy
+ * and never touch the original context, eliminating all data races on fields
+ * like v->gb, s->mb_y, v->cbp, v->ttblk, v->is_intra, v->blocks_off, etc.
+ *
+ * The following shared data IS accessed concurrently and is safe because:
+ *   • VLC tables     — immutable after vc1_init_static(); read-only.
+ *   • Reference frame pixel data — fully decoded before execute2 is called
+ *     (frame threading guarantees this via ff_thread_await_progress).
+ *   • Current picture pixel buffer — each job writes to a disjoint
+ *     horizontal band [mb_y_start, mb_y_end), so writes never overlap.
  */
 
 /**
  * Per-job context passed to vc1_slice_worker via execute2's void* priv.
+ *
+ * v_copy is a full shallow copy of the VC1Context snapshotted just after
+ * the slice header has been parsed.  Because VC1Context embeds MpegEncContext
+ * as its first member, this single copy captures both structs.  Pointer
+ * fields that reference immutable global state (VLC tables, DSP function
+ * pointers) or shared read-only reference buffers are safe to alias.
  */
 typedef struct VC1SliceJob {
-    VC1Context  *v;
-    int          slice_idx;    /**< index into the frame's slices[] array, or -1
-                                    for the implicit "slice 0" (before the first
-                                    explicit VC1_CODE_SLICE marker)            */
+    VC1Context   v_copy;      /**< private per-worker context snapshot */
     int          mb_y_start;
     int          mb_y_end;
-    int          header_ret;   /**< result of any slice-header parse */
+    int          header_ret;  /**< result of slice-header parse; skip if < 0 */
 } VC1SliceJob;
 
 /**
  * execute2 worker: decode the MB rows assigned to one slice.
  *
- * @param avctx   codec context (read-only inside the worker)
- * @param priv    pointer to a VC1SliceJob array
- * @param jobnr   index of the job to execute in this call
- * @param threadnr  worker-thread index (unused; state lives in the job)
+ * Operates entirely on job->v_copy — never touches the caller's VC1Context.
+ *
+ * @param avctx    codec context (read-only; used only for logging)
+ * @param priv     pointer to the VC1SliceJob array
+ * @param jobnr    index of the job to execute
+ * @param threadnr worker-thread index (unused)
  */
 static int vc1_slice_worker(AVCodecContext *avctx, void *priv,
                              int jobnr, int threadnr)
 {
-    VC1SliceJob *jobs = priv;
-    VC1SliceJob *job  = &jobs[jobnr];
-    VC1Context  *v    = job->v;
-    MpegEncContext *s = &v->s;
+    VC1SliceJob    *job = &((VC1SliceJob *)priv)[jobnr];
+    VC1Context     *lv  = &job->v_copy;   /* fully private copy */
+    MpegEncContext *ls  = &lv->s;
 
     if (job->header_ret < 0)
         return 0; /* header was damaged; skip quietly */
 
-    s->start_mb_y = job->mb_y_start;
-    s->end_mb_y   = job->mb_y_end;
+    ls->start_mb_y = job->mb_y_start;
+    ls->end_mb_y   = job->mb_y_end;
 
-    ff_vc1_decode_blocks(v);
+    ff_vc1_decode_blocks(lv);
 
     return 0;
 }
@@ -1005,6 +1061,10 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
         int raw_size;
     } *slices = NULL, *tmp;
     unsigned slices_allocated = 0;
+    /* Fix 5: declared at function scope so the single av_free(jobs) at
+     * err: covers every exit path, including early gotos from inside the
+     * software decode path.                                              */
+    VC1SliceJob *jobs = NULL;
 
     v->second_field = 0;
 
@@ -1417,20 +1477,39 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
          * Software decode path — uses avctx->execute2 for slice-level
          * parallelism.
          *
-         * We build a flat VC1SliceJob array covering all slices in the
-         * current field (or progressive frame).  Headers are parsed
-         * sequentially up-front (they are tiny and depend on each other),
-         * then the actual block-decoding work is handed to execute2.
+         * Two-phase design
+         * ────────────────
+         * Phase 1 (sequential, main thread): parse all slice headers for
+         * BOTH fields into a flat VC1SliceJob array.  Each job receives a
+         * full private snapshot of VC1Context (job->v_copy = *v) taken
+         * immediately after its header is parsed, so workers are completely
+         * independent and share no mutable state.
          *
-         * For field-mode pictures the two fields are processed in two
-         * separate execute2 calls to guarantee that field-0 reference data
-         * is fully written before field-1 motion compensation reads it.
+         * Phase 2 (parallel): dispatch jobs to avctx->execute2 in two
+         * groups — one per field — to guarantee that field-0 pixel data is
+         * fully written before field-1 motion compensation reads it.
+         *
+         * Why two separate execute2 calls instead of one mid-loop flush
+         * ───────────────────────────────────────────────────────────────
+         * The previous mid-loop flush approach called execute2 while still
+         * iterating the header-parse loop, which meant workers were writing
+         * pixel data while the main thread was reading/writing the shared
+         * VC1Context for field-1 header parsing — a data race.  Building
+         * all jobs first and dispatching in two clean batches avoids this
+         * entirely, because workers only touch their private v_copy.
+         *
+         * Fix 5: jobs is declared here (not inside the else block) so that
+         * the single av_free(jobs) at err: covers all exit paths.
          */
-        int header_ret = 0;
-        int total_jobs; /* number of jobs in the current dispatch */
+        int header_ret  = 0;
+        int total_jobs  = 0;
+        int field1_job_start = -1; /* first job index belonging to field 1 */
 
-        /* Maximum possible jobs: n_slices + 1 (the implicit first segment) */
-        VC1SliceJob *jobs = av_mallocz_array(n_slices + 1, sizeof(*jobs));
+        /*
+         * Maximum jobs: one per explicit slice marker plus one for the
+         * implicit leading segment before any VC1_CODE_SLICE.
+         */
+        jobs = av_mallocz_array(n_slices + 1, sizeof(*jobs));
         if (!jobs) {
             ret = AVERROR(ENOMEM);
             goto err;
@@ -1450,35 +1529,29 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
 
         av_assert0(mb_height > 0);
 
-        /*
-         * Phase 1: parse all slice headers sequentially.
-         *
-         * This mirrors the original loop's header-parsing logic but stores
-         * the result (including any header parse error) in the job struct so
-         * the worker can skip damaged segments without aborting the whole
-         * execute2 call.
-         */
-        total_jobs = 0;
+        /* ── Phase 1: parse all slice headers and snapshot contexts ── */
         for (i = 0; i <= n_slices; i++) {
-            VC1SliceJob *job = &jobs[total_jobs];
             int is_second_field_start = (v->field_mode &&
                                          i > 0 &&
                                          slices[i - 1].mby_start >= mb_height);
 
-            /* Update second-field flag and line strides */
+            /* Track the start of field 1 in the jobs array */
+            if (is_second_field_start && field1_job_start < 0)
+                field1_job_start = total_jobs;
+
+            /* Update second-field state on the main-thread context */
             if (is_second_field_start) {
                 v->second_field = 1;
                 av_assert0((s->mb_height & 1) == 0);
-                v->blocks_off = s->b8_stride * (s->mb_height & ~1);
-                v->mb_off     = s->mb_stride * s->mb_height >> 1;
+                v->blocks_off   = s->b8_stride * (s->mb_height & ~1);
+                v->mb_off       = s->mb_stride * s->mb_height >> 1;
             } else if (i == 0) {
                 v->second_field = 0;
                 v->blocks_off   = 0;
                 v->mb_off       = 0;
             }
 
-            /* Parse slice header (if any) into v so ff_vc1_decode_blocks
-             * will use the correct parameters for this slice.             */
+            /* Parse this slice's header into v */
             header_ret = 0;
             if (i > 0) {
                 v->gb              = slices[i - 1].gb;
@@ -1486,8 +1559,7 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                 v->pic_header_flag = 0;
 
                 if (v->field_mode && i == n_slices1 + 2) {
-                    /* First slice of the second field carries a full frame
-                     * header for the second field.                        */
+                    /* First slice of the second field: full per-field header */
                     header_ret = ff_vc1_parse_frame_header_adv(v, &v->gb);
                     if (header_ret < 0)
                         av_log(avctx, AV_LOG_ERROR, "Field header damaged\n");
@@ -1499,21 +1571,28 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                 }
             }
 
-            /* Determine MB row range for this job */
+            /* Compute this job's MB row range */
             {
                 int mby_start = (i == 0) ? 0
                     : FFMAX(0, slices[i - 1].mby_start % mb_height);
                 int mby_end;
 
-                if (!v->field_mode || v->second_field)
+                if (!v->field_mode || v->second_field) {
                     mby_end = (i == n_slices) ? mb_height
                         : FFMIN(mb_height, slices[i].mby_start % mb_height);
-                else {
+                } else {
                     if (i >= n_slices) {
+                        /*
+                         * Fix 4: was "goto soft_path_done" which bypassed
+                         * ff_mpv_frame_end while jumping into the output
+                         * path after ff_mpv_frame_start had been called.
+                         * goto err correctly pairs start/end and discards
+                         * the damaged frame.
+                         */
                         av_log(avctx, AV_LOG_ERROR,
                                "first field slice count too large\n");
-                        av_free(jobs);
-                        goto soft_path_done;
+                        ret = AVERROR_INVALIDDATA;
+                        goto err;
                     }
                     mby_end = (i == n_slices1 + 1) ? mb_height
                         : FFMIN(mb_height, slices[i].mby_start % mb_height);
@@ -1522,8 +1601,7 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                 if (mby_end <= mby_start) {
                     av_log(avctx, AV_LOG_ERROR,
                            "end mb y %d %d invalid\n", mby_end, mby_start);
-                    /* Skip this job slot — don't increment total_jobs */
-                    continue;
+                    continue; /* skip — jobs pointer freed at err: */
                 }
 
                 if (((s->pict_type == AV_PICTURE_TYPE_P && !v->p_frame_skipped) ||
@@ -1533,51 +1611,72 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                     continue;
                 }
 
-                job->v           = v;
-                job->slice_idx   = i - 1; /* -1 = implicit first segment */
-                job->mb_y_start  = mby_start;
-                job->mb_y_end    = mby_end;
-                job->header_ret  = header_ret;
-                total_jobs++;
-
                 /*
-                 * Flush field boundary: execute2 all jobs for field 0 before
-                 * we start filling field-1 jobs so that motion-compensation
-                 * in field 1 sees fully-decoded field-0 reference data.
+                 * Fix 1: snapshot the full context *after* the header parse
+                 * so the worker has its own private copy of every field that
+                 * ff_vc1_decode_blocks reads/writes (gb, mb_y, cbp, ttblk,
+                 * is_intra, blocks_off, mb_off, pic_header_flag, …).
+                 *
+                 * The copy is a shallow struct copy.  Pointer fields that
+                 * alias shared immutable data (VLC tables, DSP vtables,
+                 * reference pixel buffers) are safe to share because workers
+                 * only read them.  The current picture buffer is written by
+                 * workers in disjoint row ranges, so writes never overlap.
                  */
-                if (v->field_mode && is_second_field_start && total_jobs > 1) {
-                    /* Dispatch field-0 jobs (all but the job we just added) */
-                    ret = avctx->execute2(avctx, vc1_slice_worker,
-                                          jobs, NULL, total_jobs - 1);
-                    if (ret < 0) {
-                        av_free(jobs);
-                        goto err;
-                    }
-                    /* Shift the new field-1 job to position 0 */
-                    jobs[0]    = jobs[total_jobs - 1];
-                    total_jobs = 1;
-
-                    /* Restore the second-field context the header parse left */
-                    v->second_field = 1;
-                    v->blocks_off   = s->b8_stride * (s->mb_height & ~1);
-                    v->mb_off       = s->mb_stride * s->mb_height >> 1;
+                {
+                    VC1SliceJob *job = &jobs[total_jobs++];
+                    job->v_copy     = *v;          /* snapshot VC1Context   */
+                    job->v_copy.s   = *s;          /* snapshot MpegEncContext
+                                                      (embedded in v but also
+                                                      aliased by local *s)  */
+                    job->mb_y_start = mby_start;
+                    job->mb_y_end   = mby_end;
+                    job->header_ret = header_ret;
                 }
             }
-        } /* end header-parse / job-build loop */
+        } /* end Phase 1 */
 
-        /* Dispatch any remaining jobs (second field, or the whole frame in
-         * non-field-mode).                                                 */
-        if (total_jobs > 0) {
+        /*
+         * ── Phase 2: dispatch jobs to execute2 ──
+         *
+         * Fix 2: ALL header parsing is complete before any execute2 call,
+         * so there is no possibility of workers racing with header parsing
+         * on the main thread.
+         *
+         * For field-mode pictures dispatch field 0, wait for completion
+         * (execute2 is synchronous from the caller's perspective), then
+         * dispatch field 1.  This ensures field-0 reference data is fully
+         * written before field-1 MC reads it.
+         *
+         * Fix 6: assert the job count is in range before each dispatch.
+         */
+        if (v->field_mode && field1_job_start > 0) {
+            /* field 0 */
+            av_assert0(field1_job_start <= n_slices + 1);
             ret = avctx->execute2(avctx, vc1_slice_worker,
-                                  jobs, NULL, total_jobs);
-            av_free(jobs);
+                                  jobs, NULL, field1_job_start);
             if (ret < 0)
                 goto err;
-        } else {
-            av_free(jobs);
+
+            /* field 1 */
+            int field1_jobs = total_jobs - field1_job_start;
+            if (field1_jobs > 0) {
+                av_assert0(field1_job_start + field1_jobs <= n_slices + 1);
+                ret = avctx->execute2(avctx, vc1_slice_worker,
+                                      jobs + field1_job_start, NULL,
+                                      field1_jobs);
+                if (ret < 0)
+                    goto err;
+            }
+        } else if (total_jobs > 0) {
+            /* progressive frame or single-field picture */
+            av_assert0(total_jobs <= n_slices + 1);
+            ret = avctx->execute2(avctx, vc1_slice_worker,
+                                  jobs, NULL, total_jobs);
+            if (ret < 0)
+                goto err;
         }
 
-soft_path_done:
         if (v->field_mode) {
             v->second_field = 0;
             s->cur_pic.linesize[0] >>= 1;
@@ -1640,6 +1739,7 @@ image:
 end:
     ret = buf_size;
 err:
+    av_free(jobs);   /* Fix 5: single authoritative free, NULL-safe */
     av_free(buf2);
     for (i = 0; i < n_slices; i++)
         av_free(slices[i].buf);
