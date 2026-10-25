@@ -24,6 +24,32 @@
 /**
  * @file
  * VC-1 and WMV3 decoder
+ *
+ * Frame threading
+ *
+ * The vc1 and wmv3 decoders support frame threading; the image (sprite)
+ * decoders do not. Each thread has its own VC1Context and decodes whole
+ * pictures, and a picture can be decoded while the pictures it references
+ * are still being decoded by other threads:
+ *
+ * - Before a thread decodes a picture, vc1_update_thread_context() copies
+ *   the state its headers build on from the thread that decoded the
+ *   previous one: sequence and entry point parameters, the reference
+ *   pictures, intensity compensation and the field MV flags of the last
+ *   field-coded anchor. This happens once the previous thread has called
+ *   ff_thread_finish_setup(), which vc1_decode_frame() does as early as
+ *   possible: right after the picture header for most pictures, after
+ *   decoding for those whose later headers can still change that state.
+ *
+ * - Reference pictures report their progress in MB rows of the frame as
+ *   they are decoded, trailing the overlap and loop filters (see
+ *   vc1_report_decode_progress() in vc1_block.c). Field-coded pictures are
+ *   only reported as a whole, by ff_mpv_frame_end().
+ *
+ * - Before a block is predicted from a reference picture, the decoding
+ *   thread waits until the rows it reads are available (vc1_await_ref() in
+ *   vc1_mc.c). The same applies to the rows copied for skipped pictures and
+ *   to the co-located motion read by B-picture direct mode (vc1_block.c).
  */
 
 #include "config_components.h"
@@ -788,12 +814,21 @@ av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
 }
 
 #if HAVE_THREADS
-/* point dst's field at the same member that src's field points to */
+/* Point v->field at the member of v that v1->field points to in v1. */
 #define REMAP_PTR(field, a, b, c)                                         \
     v->field = v1->field == &v1->a ? &v->a :                              \
                v1->field == &v1->b ? &v->b :                              \
                v1->field == &v1->c ? &v->c : NULL
 
+/**
+ * Bring the context of the thread about to decode the next picture (dst) up
+ * to date with the thread that decoded the previous one (src).
+ *
+ * This is called once src has finished setup (see the comment before
+ * ff_thread_finish_setup() in vc1_decode_frame()), while src may still be
+ * decoding its picture. Only state that src no longer modifies at that point
+ * may be read here.
+ */
 static int vc1_update_thread_context(AVCodecContext *dst,
                                      const AVCodecContext *src)
 {
@@ -807,8 +842,8 @@ static int vc1_update_thread_context(AVCodecContext *dst,
         return 0;
 
     /* The size-dependent VC-1 tables are allocated together with the
-     * MpegEncContext, so (re)initialize everything here instead of letting
-     * ff_mpeg_update_thread_context() resize only the latter. */
+     * MpegEncContext, so (re)initialize both when the picture size changed
+     * or dst has not decoded anything yet. */
     if (s->context_initialized &&
         (s->width != s1->width || s->height != s1->height))
         vc1_decode_reset(dst);
@@ -818,15 +853,24 @@ static int vc1_update_thread_context(AVCodecContext *dst,
             return ret;
     }
 
-    ret = ff_mpeg_update_thread_context(dst, src);
-    if (ret < 0)
-        return ret;
+    /* Reference pictures. ff_mpeg_update_thread_context() is not used: it
+     * copies the work pictures and line sizes as they are in src, but field
+     * pictures are decoded with those doubled in place (see the software
+     * decoding path in vc1_decode_frame()), possibly at this very moment.
+     * The MPVPicture pointers stay the same throughout decoding, so derive
+     * the work pictures from them instead. The line sizes are set up by
+     * ff_mpv_frame_start() in dst itself; quarter_sample and mspel are set
+     * by every picture header that needs them. */
+    ff_mpv_workpic_from_pic(&s->cur_pic,  s1->cur_pic.ptr);
+    ff_mpv_workpic_from_pic(&s->last_pic, s1->last_pic.ptr);
+    ff_mpv_workpic_from_pic(&s->next_pic, s1->next_pic.ptr);
+    s->low_delay       = s1->low_delay;
+    s->workaround_bugs = s1->workaround_bugs;
+    s->h_edge_pos      = s1->h_edge_pos;
+    s->v_edge_pos      = s1->v_edge_pos;
 
-    s->h_edge_pos = s1->h_edge_pos;
-    s->v_edge_pos = s1->v_edge_pos;
-    s->mspel      = s1->mspel;
-
-    /* sequence header and entry point */
+    /* Sequence header and entry point; in-band entry points can change these
+     * between pictures. The first block is a run of plain ints. */
     memcpy(&v->res_sprite, &v1->res_sprite,
            (const char *)&v1->finterpflag + sizeof(v1->finterpflag) -
            (const char *)&v1->res_sprite);
@@ -840,13 +884,21 @@ static int vc1_update_thread_context(AVCodecContext *dst,
     v->closed_entry     = v1->closed_entry;
     v->resync_marker    = v1->resync_marker;
 
-    /* picture-level state that carries over to following pictures */
-    v->rnd      = v1->rnd;
-    v->mvrange  = v1->mvrange;
-    v->respic   = v1->respic;
-    v->refdist  = v1->refdist;
+    /* Picture header state that the next header builds on instead of
+     * re-reading it: in Simple/Main profile, P-pictures toggle the rounding
+     * control, B-pictures inherit RESPIC, and MVRANGE is kept unless the
+     * header signals it. Field B-pictures, which finish setup early, can
+     * rewrite MVRANGE in their second field header, but they never use the
+     * Simple/Main syntax. REFDIST carries over to field B-pictures. */
+    v->rnd     = v1->rnd;
+    v->respic  = v1->respic;
+    v->refdist = v1->refdist;
+    if (v1->profile != PROFILE_ADVANCED)
+        v->mvrange = v1->mvrange;
 
-    /* intensity compensation of the reference pictures */
+    /* Intensity compensation of the reference pictures. The LUTs and flags
+     * are rotated along with the references when a picture header is
+     * parsed, and the current ones are pointed to by curr_*. */
     memcpy(v->last_luty,  v1->last_luty,  sizeof(v->last_luty));
     memcpy(v->last_lutuv, v1->last_lutuv, sizeof(v->last_lutuv));
     memcpy(v->next_luty,  v1->next_luty,  sizeof(v->next_luty));
@@ -860,9 +912,10 @@ static int vc1_update_thread_context(AVCodecContext *dst,
     REMAP_PTR(curr_lutuv,  last_lutuv[0], next_lutuv[0], aux_lutuv[0]);
     REMAP_PTR(curr_use_ic, last_use_ic,   next_use_ic,   aux_use_ic);
 
-    /* Field MV flags of the last field-coded anchor, used by direct-mode
-     * prediction in field B-pictures. The source thread does not call
-     * ff_thread_finish_setup() before it has swapped them in place. */
+    /* Field MV flags of the last field-coded anchor, read by direct-mode
+     * prediction in field B-pictures. Anchors swap them in place only after
+     * decoding, and do not finish setup before that. B-pictures only read
+     * them. */
     memcpy(v->mv_f_next[0]  - (s->b8_stride  + 1),
            v1->mv_f_next[0] - (s1->b8_stride + 1),
            2 * vc1_mv_f_plane_size(s));
@@ -1155,21 +1208,28 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
         s->cur_pic.ptr->f->repeat_pict = v->rptfrm * 2;
     }
 
-    /* Everything later pictures depend on is known at this point, unless
-     * the software decoding below can still change it, in which case setup
-     * is finished after decoding:
-     * - field pictures are decoded with s->linesize and the work picture
-     *   line sizes doubled, which must not be copied to other threads;
-     *   also, the second field header of I/P pictures can update the
-     *   intensity compensation state, and the field MV flags needed by
-     *   subsequent field B-pictures are final only once both fields are
-     *   decoded
-     * - slices can repeat the picture header
-     * Hardware decoding does not use any of that, and requires setup to be
+    /* Frame threading: let the next picture start decoding in another
+     * thread as soon as everything it depends on is known. That is the case
+     * now, except when the software decoding below can still change it:
+     * - The header of the second field of an I/P field picture can update
+     *   the intensity compensation state, and the field MV flags that
+     *   subsequent field B-pictures predict from are swapped into
+     *   v->mv_f_next only once both fields are decoded.
+     * - Slices can repeat the picture header.
+     * Setup is then finished by the generic code once decoding returns.
+     * Field B-pictures do not have this problem; what their second field
+     * header changes is not used by later pictures (see
+     * vc1_update_thread_context()).
+     * Hardware decoding uses none of this state, and requires setup to be
      * finished before the hwaccel is called. */
-    late_setup = v->field_mode;
-    for (i = 0; i < n_slices && !late_setup; i++)
-        late_setup = show_bits1(&slices[i].gb);
+    late_setup = v->field_mode && s->pict_type != AV_PICTURE_TYPE_B;
+    for (i = 0; i < n_slices && !late_setup; i++) {
+        /* the first bit after a slice address is the PIC_HEADER_FLAG; field
+         * markers carry a second field header instead, but then late_setup
+         * is either already set or the picture is a B-picture */
+        if (!(v->field_mode && i == n_slices1 + 1))
+            late_setup = show_bits1(&slices[i].gb);
+    }
     if (avctx->hwaccel || !late_setup)
         ff_thread_finish_setup(avctx);
 
