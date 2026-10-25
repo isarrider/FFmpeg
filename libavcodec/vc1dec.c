@@ -42,6 +42,8 @@
 #include "msmpeg4_vc1_data.h"
 #include "profiles.h"
 #include "simple_idct.h"
+#include "thread.h"
+#include "threadprogress.h"
 #include "vc1.h"
 #include "vc1data.h"
 #include "vc1_vlc_data.h"
@@ -356,6 +358,14 @@ static av_cold void vc1_sprite_flush(AVCodecContext *avctx)
 
 #endif
 
+/** Size of one of the two planes of v->mv_f / v->mv_f_next. */
+static size_t vc1_mv_f_plane_size(const MpegEncContext *s)
+{
+    int mb_height = FFALIGN(s->mb_height, 2);
+
+    return s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2;
+}
+
 static av_cold int vc1_decode_init_alloc_tables(VC1Context *v)
 {
     MpegEncContext *s = &v->s;
@@ -403,16 +413,16 @@ static av_cold int vc1_decode_init_alloc_tables(VC1Context *v)
     if (!v->blk_mv_type_base)
         return AVERROR(ENOMEM);
     v->blk_mv_type      = v->blk_mv_type_base + s->b8_stride + 1;
-    v->mv_f_base        = av_mallocz(2 * (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2));
+    v->mv_f_base        = av_mallocz(2 * vc1_mv_f_plane_size(s));
     if (!v->mv_f_base)
         return AVERROR(ENOMEM);
     v->mv_f[0]          = v->mv_f_base + s->b8_stride + 1;
-    v->mv_f[1]          = v->mv_f[0] + (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2);
-    v->mv_f_next_base   = av_mallocz(2 * (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2));
+    v->mv_f[1]          = v->mv_f[0] + vc1_mv_f_plane_size(s);
+    v->mv_f_next_base   = av_mallocz(2 * vc1_mv_f_plane_size(s));
     if (!v->mv_f_next_base)
         return AVERROR(ENOMEM);
     v->mv_f_next[0]     = v->mv_f_next_base + s->b8_stride + 1;
-    v->mv_f_next[1]     = v->mv_f_next[0] + (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2);
+    v->mv_f_next[1]     = v->mv_f_next[0] + vc1_mv_f_plane_size(s);
 
     if (s->avctx->codec_id == AV_CODEC_ID_WMV3IMAGE || s->avctx->codec_id == AV_CODEC_ID_VC1IMAGE) {
         for (i = 0; i < 4; i++)
@@ -731,7 +741,12 @@ static av_cold int vc1_decode_init(AVCodecContext *avctx)
             return AVERROR_PATCHWELCOME;
         }
     }
-    return 0;
+
+    /* The MpegEncContext is only fully initialized once the first frame
+     * header has been parsed, but the picture pool has to be set up here:
+     * with frame threading, all threads share the pool of the first one,
+     * which can only be synced during init. */
+    return ff_mpv_decode_init(s, avctx);
 }
 
 static av_cold void vc1_decode_reset(AVCodecContext *avctx)
@@ -772,6 +787,91 @@ av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
     return ff_mpv_decode_close(avctx);
 }
 
+#if HAVE_THREADS
+/* point dst's field at the same member that src's field points to */
+#define REMAP_PTR(field, a, b, c)                                         \
+    v->field = v1->field == &v1->a ? &v->a :                              \
+               v1->field == &v1->b ? &v->b :                              \
+               v1->field == &v1->c ? &v->c : NULL
+
+static int vc1_update_thread_context(AVCodecContext *dst,
+                                     const AVCodecContext *src)
+{
+    VC1Context       *const v  = dst->priv_data;
+    const VC1Context *const v1 = src->priv_data;
+    MpegEncContext       *const s  = &v->s;
+    const MpegEncContext *const s1 = &v1->s;
+    int ret;
+
+    if (dst == src || !s1->context_initialized)
+        return 0;
+
+    /* The size-dependent VC-1 tables are allocated together with the
+     * MpegEncContext, so (re)initialize everything here instead of letting
+     * ff_mpeg_update_thread_context() resize only the latter. */
+    if (s->context_initialized &&
+        (s->width != s1->width || s->height != s1->height))
+        vc1_decode_reset(dst);
+    if (!s->context_initialized) {
+        ret = ff_vc1_decode_init(dst);
+        if (ret < 0)
+            return ret;
+    }
+
+    ret = ff_mpeg_update_thread_context(dst, src);
+    if (ret < 0)
+        return ret;
+
+    s->h_edge_pos = s1->h_edge_pos;
+    s->v_edge_pos = s1->v_edge_pos;
+    s->mspel      = s1->mspel;
+
+    /* sequence header and entry point */
+    memcpy(&v->res_sprite, &v1->res_sprite,
+           (const char *)&v1->finterpflag + sizeof(v1->finterpflag) -
+           (const char *)&v1->res_sprite);
+    v->zz_8x4           = v1->zz_8x4;
+    v->zz_4x8           = v1->zz_4x8;
+    v->range_mapy_flag  = v1->range_mapy_flag;
+    v->range_mapuv_flag = v1->range_mapuv_flag;
+    v->range_mapy       = v1->range_mapy;
+    v->range_mapuv      = v1->range_mapuv;
+    v->broken_link      = v1->broken_link;
+    v->closed_entry     = v1->closed_entry;
+    v->resync_marker    = v1->resync_marker;
+
+    /* picture-level state that carries over to following pictures */
+    v->rnd      = v1->rnd;
+    v->mvrange  = v1->mvrange;
+    v->respic   = v1->respic;
+    v->refdist  = v1->refdist;
+
+    /* intensity compensation of the reference pictures */
+    memcpy(v->last_luty,  v1->last_luty,  sizeof(v->last_luty));
+    memcpy(v->last_lutuv, v1->last_lutuv, sizeof(v->last_lutuv));
+    memcpy(v->next_luty,  v1->next_luty,  sizeof(v->next_luty));
+    memcpy(v->next_lutuv, v1->next_lutuv, sizeof(v->next_lutuv));
+    memcpy(v->aux_luty,   v1->aux_luty,   sizeof(v->aux_luty));
+    memcpy(v->aux_lutuv,  v1->aux_lutuv,  sizeof(v->aux_lutuv));
+    v->last_use_ic = v1->last_use_ic;
+    v->next_use_ic = v1->next_use_ic;
+    v->aux_use_ic  = v1->aux_use_ic;
+    REMAP_PTR(curr_luty,   last_luty[0],  next_luty[0],  aux_luty[0]);
+    REMAP_PTR(curr_lutuv,  last_lutuv[0], next_lutuv[0], aux_lutuv[0]);
+    REMAP_PTR(curr_use_ic, last_use_ic,   next_use_ic,   aux_use_ic);
+
+    /* Field MV flags of the last field-coded anchor, used by direct-mode
+     * prediction in field B-pictures. The source thread does not call
+     * ff_thread_finish_setup() before it has swapped them in place. */
+    memcpy(v->mv_f_next[0]  - (s->b8_stride  + 1),
+           v1->mv_f_next[0] - (s1->b8_stride + 1),
+           2 * vc1_mv_f_plane_size(s));
+
+    return 0;
+}
+#undef REMAP_PTR
+#endif
+
 /** Decode a VC1/WMV3 frame
  * @todo TODO: Handle VC-1 IDUs (Transport level?)
  */
@@ -793,6 +893,7 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
         int raw_size;
     } *slices = NULL, *tmp;
     unsigned slices_allocated = 0;
+    int frame_started = 0, late_setup;
 
     v->second_field = 0;
 
@@ -1035,6 +1136,7 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
     if ((ret = ff_mpv_frame_start(s, avctx)) < 0) {
         goto err;
     }
+    frame_started = 1;
 
     v->s.cur_pic.ptr->field_picture = v->field_mode;
     v->s.cur_pic.ptr->f->flags |= AV_FRAME_FLAG_INTERLACED * (v->fcm != PROGRESSIVE);
@@ -1052,6 +1154,24 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
         // repeat frames
         s->cur_pic.ptr->f->repeat_pict = v->rptfrm * 2;
     }
+
+    /* Everything later pictures depend on is known at this point, unless
+     * the software decoding below can still change it, in which case setup
+     * is finished after decoding:
+     * - field pictures are decoded with s->linesize and the work picture
+     *   line sizes doubled, which must not be copied to other threads;
+     *   also, the second field header of I/P pictures can update the
+     *   intensity compensation state, and the field MV flags needed by
+     *   subsequent field B-pictures are final only once both fields are
+     *   decoded
+     * - slices can repeat the picture header
+     * Hardware decoding does not use any of that, and requires setup to be
+     * finished before the hwaccel is called. */
+    late_setup = v->field_mode;
+    for (i = 0; i < n_slices && !late_setup; i++)
+        late_setup = show_bits1(&slices[i].gb);
+    if (avctx->hwaccel || !late_setup)
+        ff_thread_finish_setup(avctx);
 
     if (avctx->hwaccel) {
         const FFHWAccel *hwaccel = ffhwaccel(avctx->hwaccel);
@@ -1345,6 +1465,10 @@ image:
 end:
     ret = buf_size;
 err:
+    /* Unblock threads using this picture as reference if decoding stopped
+     * before ff_mpv_frame_end(). */
+    if (ret < 0 && frame_started)
+        ff_thread_progress_report(&s->cur_pic.ptr->progress, INT_MAX);
     av_free(buf2);
     for (i = 0; i < n_slices; i++)
         av_free(slices[i].buf);
@@ -1362,8 +1486,10 @@ const FFCodec ff_vc1_decoder = {
     .init           = vc1_decode_init,
     .close          = ff_vc1_decode_end,
     FF_CODEC_DECODE_CB(vc1_decode_frame),
+    UPDATE_THREAD_CONTEXT(vc1_update_thread_context),
     .flush          = ff_mpeg_flush,
-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                      AV_CODEC_CAP_FRAME_THREADS,
     .hw_configs     = (const AVCodecHWConfigInternal *const []) {
 #if CONFIG_VC1_DXVA2_HWACCEL
                         HWACCEL_DXVA2(vc1),
@@ -1404,8 +1530,10 @@ const FFCodec ff_wmv3_decoder = {
     .init           = vc1_decode_init,
     .close          = ff_vc1_decode_end,
     FF_CODEC_DECODE_CB(vc1_decode_frame),
+    UPDATE_THREAD_CONTEXT(vc1_update_thread_context),
     .flush          = ff_mpeg_flush,
-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                      AV_CODEC_CAP_FRAME_THREADS,
     .hw_configs     = (const AVCodecHWConfigInternal *const []) {
 #if CONFIG_WMV3_DXVA2_HWACCEL
                         HWACCEL_DXVA2(wmv3),

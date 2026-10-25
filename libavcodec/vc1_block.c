@@ -31,6 +31,7 @@
 #include "mpegvideo.h"
 #include "mpegvideodec.h"
 #include "msmpeg4_vc1_data.h"
+#include "threadprogress.h"
 #include "unary.h"
 #include "vc1.h"
 #include "vc1_pred.h"
@@ -73,6 +74,22 @@ static inline void update_block_index(MpegEncContext *s)
 }
 
 /** @} */ //Bitplane group
+
+/**
+ * Report the MB rows of a frame-coded reference picture that are final.
+ *
+ * Overlap smoothing and the loop filter trail the decoding loop by up to
+ * two MB rows, so only rows above that are reported, with a safety margin.
+ * Field pictures are only reported as a whole by ff_mpv_frame_end().
+ */
+static void vc1_report_decode_progress(VC1Context *v)
+{
+    MpegEncContext *s = &v->s;
+
+    if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME) &&
+        s->cur_pic.reference && !v->field_mode && !s->er.error_occurred)
+        ff_thread_progress_report(&s->cur_pic.ptr->progress, s->mb_y - 4);
+}
 
 static void vc1_put_blocks_clamped(VC1Context *v, int put_signed)
 {
@@ -2606,6 +2623,7 @@ static void vc1_decode_i_blocks(VC1Context *v)
             v->cur_blk_idx = (v->cur_blk_idx + 1) % (v->end_mb_x + 2);
         }
 
+        vc1_report_decode_progress(v);
         s->first_slice_line = 0;
     }
 
@@ -2739,6 +2757,7 @@ static int vc1_decode_i_blocks_adv(VC1Context *v)
             inc_blk_idx(v->left_blk_idx);
             inc_blk_idx(v->cur_blk_idx);
         }
+        vc1_report_decode_progress(v);
         s->first_slice_line = 0;
     }
 
@@ -2830,6 +2849,7 @@ static void vc1_decode_p_blocks(VC1Context *v)
         memmove(v->luma_mv_base,
                 v->luma_mv - s->mb_stride,
                 sizeof(v->luma_mv_base[0]) * 2 * s->mb_stride);
+        vc1_report_decode_progress(v);
         s->first_slice_line = 0;
     }
     ff_er_add_slice(&s->er, 0, s->start_mb_y << v->field_mode, s->mb_width - 1,
@@ -2869,6 +2889,11 @@ static void vc1_decode_b_blocks(VC1Context *v)
     for (s->mb_y = s->start_mb_y; s->mb_y < s->end_mb_y; s->mb_y++) {
         s->mb_x = 0;
         init_block_index(v);
+        /* direct mode reads the co-located motion of the next anchor */
+        if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME) &&
+            s->next_pic.ptr)
+            ff_thread_progress_await(&s->next_pic.ptr->progress,
+                                     s->mb_y + v->mb_off / s->mb_stride);
         for (; s->mb_x < s->mb_width; s->mb_x++) {
             update_block_index(s);
 
@@ -2927,9 +2952,12 @@ static void vc1_decode_skip_blocks(VC1Context *v)
         s->mb_x = 0;
         init_block_index(v);
         update_block_index(s);
+        if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME))
+            ff_thread_progress_await(&s->last_pic.ptr->progress, s->mb_y);
         memcpy(s->dest[0], s->last_pic.data[0] + s->mb_y * 16 * s->linesize,   s->linesize   * 16);
         memcpy(s->dest[1], s->last_pic.data[1] + s->mb_y *  8 * s->uvlinesize, s->uvlinesize *  8);
         memcpy(s->dest[2], s->last_pic.data[2] + s->mb_y *  8 * s->uvlinesize, s->uvlinesize *  8);
+        vc1_report_decode_progress(v);
         s->first_slice_line = 0;
     }
 }

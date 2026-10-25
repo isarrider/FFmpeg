@@ -30,7 +30,32 @@
 #include "h264chroma.h"
 #include "mathops.h"
 #include "mpegvideo.h"
+#include "threadprogress.h"
 #include "vc1.h"
+
+/**
+ * With frame threading, wait until the rows of the reference picture a
+ * block can read from have been decoded.
+ *
+ * @param ref   reference picture, NULL if it is the current picture
+ * @param src_y first luma line of the referenced block (chroma lines
+ *              doubled), in lines of the current frame or field
+ */
+static av_always_inline void vc1_await_ref(const VC1Context *v,
+                                           const MPVWorkPicture *ref,
+                                           int src_y)
+{
+    const MpegEncContext *s = &v->s;
+
+    if (HAVE_THREADS && ref && ref->ptr &&
+        (s->avctx->active_thread_type & FF_THREAD_FRAME)) {
+        /* A 16-line block plus interpolation taps, read either from one
+         * field or field-wise from a frame, spans less than 40 lines. */
+        int y = FFMAX(src_y + 40, 0) << v->field_mode;
+
+        ff_thread_progress_await(&ref->ptr->progress, y >> 4);
+    }
+}
 
 static av_always_inline void vc1_scale_luma(uint8_t *srcY,
                                             int k, int linesize)
@@ -178,6 +203,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
     int v_edge_pos = s->v_edge_pos >> v->field_mode;
     int i;
     const uint8_t (*luty)[256], (*lutuv)[256];
+    const MPVWorkPicture *ref;
     int use_ic;
     int interlace;
     int linesize, uvlinesize;
@@ -226,6 +252,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
             lutuv = v->curr_lutuv;
             use_ic = *v->curr_use_ic;
             interlace = 1;
+            ref = NULL;
         } else {
             srcY = s->last_pic.data[0];
             srcU = s->last_pic.data[1];
@@ -234,6 +261,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
             lutuv = v->last_lutuv;
             use_ic = v->last_use_ic;
             interlace = v->last_interlaced;
+            ref = &s->last_pic;
         }
     } else {
         srcY = s->next_pic.data[0];
@@ -243,6 +271,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
         lutuv = v->next_lutuv;
         use_ic = v->next_use_ic;
         interlace = v->next_interlaced;
+        ref = &s->next_pic;
     }
 
     if (!srcY || !srcU) {
@@ -271,6 +300,8 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
             uvsrc_y = av_clip(uvsrc_y, -8, s->avctx->coded_height >> 1);
         }
     }
+
+    vc1_await_ref(v, ref, FFMAX(src_y, 2 * uvsrc_y));
 
     srcY += src_y   * s->linesize   + src_x;
     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
@@ -458,6 +489,7 @@ void ff_vc1_mc_4mv_luma(VC1Context *v, int n, int dir, int avg)
     int fieldmv = (v->fcm == ILACE_FRAME) ? v->blk_mv_type[s->block_index[n]] : 0;
     int v_edge_pos = s->v_edge_pos >> v->field_mode;
     const uint8_t (*luty)[256];
+    const MPVWorkPicture *ref;
     int use_ic;
     int interlace;
     int linesize;
@@ -478,17 +510,20 @@ void ff_vc1_mc_4mv_luma(VC1Context *v, int n, int dir, int avg)
             luty = v->curr_luty;
             use_ic = *v->curr_use_ic;
             interlace = 1;
+            ref = NULL;
         } else {
             srcY = s->last_pic.data[0];
             luty = v->last_luty;
             use_ic = v->last_use_ic;
             interlace = v->last_interlaced;
+            ref = &s->last_pic;
         }
     } else {
         srcY = s->next_pic.data[0];
         luty = v->next_luty;
         use_ic = v->next_use_ic;
         interlace = v->next_interlaced;
+        ref = &s->next_pic;
     }
 
     if (!srcY) {
@@ -552,6 +587,8 @@ void ff_vc1_mc_4mv_luma(VC1Context *v, int n, int dir, int avg)
         else
             src_y = av_clip(src_y, -18, s->avctx->coded_height + 1);
     }
+
+    vc1_await_ref(v, ref, src_y);
 
     srcY += src_y * s->linesize + src_x;
     if (v->field_mode && v->ref_field_type[dir])
@@ -641,6 +678,7 @@ void ff_vc1_mc_4mv_chroma(VC1Context *v, int dir)
     int chroma_ref_type;
     int v_edge_pos = s->v_edge_pos >> v->field_mode;
     const uint8_t (*lutuv)[256];
+    const MPVWorkPicture *ref;
     int use_ic;
     int interlace;
     int uvlinesize;
@@ -703,12 +741,14 @@ void ff_vc1_mc_4mv_chroma(VC1Context *v, int dir)
             lutuv = v->curr_lutuv;
             use_ic = *v->curr_use_ic;
             interlace = 1;
+            ref = NULL;
         } else {
             srcU = s->last_pic.data[1];
             srcV = s->last_pic.data[2];
             lutuv = v->last_lutuv;
             use_ic = v->last_use_ic;
             interlace = v->last_interlaced;
+            ref = &s->last_pic;
         }
     } else {
         srcU = s->next_pic.data[1];
@@ -716,12 +756,15 @@ void ff_vc1_mc_4mv_chroma(VC1Context *v, int dir)
         lutuv = v->next_lutuv;
         use_ic = v->next_use_ic;
         interlace = v->next_interlaced;
+        ref = &s->next_pic;
     }
 
     if (!srcU) {
         av_log(v->s.avctx, AV_LOG_ERROR, "Referenced frame missing.\n");
         return;
     }
+
+    vc1_await_ref(v, ref, 2 * uvsrc_y);
 
     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
     srcV += uvsrc_y * s->uvlinesize + uvsrc_x;
@@ -885,12 +928,14 @@ void ff_vc1_mc_4mv_chroma4(VC1Context *v, int dir, int dir2, int avg)
             lutuv  = v->next_lutuv;
             use_ic = v->next_use_ic;
             interlace = v->next_interlaced;
+            vc1_await_ref(v, &s->next_pic, 2 * uvsrc_y);
         } else {
             srcU = s->last_pic.data[1];
             srcV = s->last_pic.data[2];
             lutuv  = v->last_lutuv;
             use_ic = v->last_use_ic;
             interlace = v->last_interlaced;
+            vc1_await_ref(v, &s->last_pic, 2 * uvsrc_y);
         }
         if (!srcU)
             return;
@@ -1055,6 +1100,8 @@ void ff_vc1_interp_mc(VC1Context *v)
             uvsrc_y = av_clip(uvsrc_y,  -8, s->avctx->coded_height >> 1);
         }
     }
+
+    vc1_await_ref(v, &s->next_pic, FFMAX(src_y, 2 * uvsrc_y));
 
     srcY += src_y   * s->linesize   + src_x;
     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
