@@ -37,6 +37,20 @@
  * With frame threading, wait until the rows of the reference picture a
  * block can read from have been decoded.
  *
+ *    reference picture
+ *   ┌────────────────────────────────┐
+ *   │██████ reported rows ███████████│
+ *   │█████████████████┌────────┐█████│ ◀─ src_y (MV already applied)
+ *   │█████████████████│ block  │█████│    16 lines + interpolation taps,
+ *   │█████████████████└────────┘█████│    or every other line of 2 * 16
+ *   │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│ ◀─ src_y + 40: waited for
+ *   │                                │
+ *   │      still being decoded       │
+ *   └────────────────────────────────┘
+ *
+ * In field pictures, src_y counts field lines, which are twice as far
+ * apart in the frame whose rows are reported.
+ *
  * @param ref   reference picture, NULL if it is the current picture
  * @param src_y first luma line of the referenced block (chroma lines
  *              doubled), in lines of the current frame or field

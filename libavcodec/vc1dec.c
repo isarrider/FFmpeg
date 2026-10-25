@@ -26,30 +26,47 @@
  * VC-1 and WMV3 decoder
  *
  * Frame threading
- *
+ * ───────────────
  * The vc1 and wmv3 decoders support frame threading; the image (sprite)
- * decoders do not. Each thread has its own VC1Context and decodes whole
- * pictures, and a picture can be decoded while the pictures it references
- * are still being decoded by other threads:
+ * decoders do not. Each thread owns a complete VC1Context and decodes whole
+ * pictures. A picture can be decoded while the pictures it references are
+ * still being decoded by other threads, so the work overlaps like this
+ * (I P B B in decoding order, three threads, time flows to the right):
  *
- * - Before a thread decodes a picture, vc1_update_thread_context() copies
- *   the state its headers build on from the thread that decoded the
- *   previous one: sequence and entry point parameters, the reference
- *   pictures, intensity compensation and the field MV flags of the last
- *   field-coded anchor. This happens once the previous thread has called
- *   ff_thread_finish_setup(), which vc1_decode_frame() does as early as
- *   possible: right after the picture header for most pictures, after
- *   decoding for those whose later headers can still change that state.
+ *   time ──────────────────────────────────────────────────────────────▶
  *
- * - Reference pictures report their progress in MB rows of the frame as
- *   they are decoded, trailing the overlap and loop filters (see
- *   vc1_report_decode_progress() in vc1_block.c). Field-coded pictures are
- *   only reported as a whole, by ff_mpv_frame_end().
+ *   thread 0 │hdr I│═════════════ decode I ══════════════│
+ *                  │ finish_setup
+ *                  ▼
+ *   thread 1       │hdr P│══════════ decode P ══════════════════│
+ *                        │  (waits for the rows of I it reads)
+ *                        ▼
+ *   thread 2             │hdr B│═════════ decode B ═════════════════│
+ *                                (waits for rows of I and P)
  *
- * - Before a block is predicted from a reference picture, the decoding
- *   thread waits until the rows it reads are available (vc1_await_ref() in
- *   vc1_mc.c). The same applies to the rows copied for skipped pictures and
- *   to the co-located motion read by B-picture direct mode (vc1_block.c).
+ * Three mechanisms make this work:
+ *
+ *   ┌─ 1. State hand-over ───────────────────────────────────────────────┐
+ *   │ Before a thread decodes a picture, vc1_update_thread_context()     │
+ *   │ copies what its headers build on from the thread that decoded the  │
+ *   │ previous picture: sequence/entry point parameters, the reference   │
+ *   │ pictures, intensity compensation and the field MV flags of the     │
+ *   │ last field-coded anchor. That happens once the previous thread has │
+ *   │ called ff_thread_finish_setup(); vc1_decode_frame() does so right  │
+ *   │ after the picture header whenever it can (see the table there).    │
+ *   └────────────────────────────────────────────────────────────────────┘
+ *   ┌─ 2. Progress reporting (producer) ─────────────────────────────────┐
+ *   │ A frame-coded reference picture reports, MB row by MB row, which   │
+ *   │ rows are final, trailing the overlap and loop filters             │
+ *   │ (vc1_report_decode_progress() in vc1_block.c). Field-coded        │
+ *   │ pictures are reported only as a whole, by ff_mpv_frame_end().     │
+ *   └────────────────────────────────────────────────────────────────────┘
+ *   ┌─ 3. Waiting (consumer) ────────────────────────────────────────────┐
+ *   │ Before a block is predicted from a reference picture, the thread   │
+ *   │ waits until the rows it reads are reported (vc1_await_ref() in     │
+ *   │ vc1_mc.c). Skipped pictures wait before copying a row, and B-      │
+ *   │ picture direct mode before reading co-located motion (vc1_block.c).│
+ *   └────────────────────────────────────────────────────────────────────┘
  */
 
 #include "config_components.h"
@@ -828,6 +845,23 @@ av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
  * ff_thread_finish_setup() in vc1_decode_frame()), while src may still be
  * decoding its picture. Only state that src no longer modifies at that point
  * may be read here.
+ *
+ *   ┌────────────────────────────┬──────────────────────────────────────┐
+ *   │ copied                     │ because                              │
+ *   ├────────────────────────────┼──────────────────────────────────────┤
+ *   │ cur/last/next picture      │ reference picture management         │
+ *   │ sequence + entry point     │ in-band entry points can change them │
+ *   │ rnd, respic, mvrange       │ Simple/Main headers build on them    │
+ *   │ refdist                    │ used by the following field B-pics   │
+ *   │ IC LUTs + use_ic flags     │ rotated along with the references    │
+ *   │ mv_f_next                  │ field B-picture direct prediction    │
+ *   ├────────────────────────────┼──────────────────────────────────────┤
+ *   │ not copied                 │                                      │
+ *   ├────────────────────────────┼──────────────────────────────────────┤
+ *   │ line sizes, work pictures  │ doubled in place by field pictures   │
+ *   │ quarter_sample, mspel, pq, │ set again by every picture header    │
+ *   │ VLC tables, bitplanes, ... │ that uses them                       │
+ *   └────────────────────────────┴──────────────────────────────────────┘
  */
 static int vc1_update_thread_context(AVCodecContext *dst,
                                      const AVCodecContext *src)
@@ -856,7 +890,18 @@ static int vc1_update_thread_context(AVCodecContext *dst,
     /* Reference pictures. ff_mpeg_update_thread_context() is not used: it
      * copies the work pictures and line sizes as they are in src, but field
      * pictures are decoded with those doubled in place (see the software
-     * decoding path in vc1_decode_frame()), possibly at this very moment.
+     * decoding path in vc1_decode_frame()), possibly at this very moment:
+     *
+     *    frame buffer          while decoding field 0   ... and field 1
+     *   ┌──────────────┐       ┌──────────────┐
+     *   │ line 0  top  │ ────▶ │ line 0       │
+     *   │ line 1  bot  │ ──────┼──────────────┼──────▶ line 0
+     *   │ line 2  top  │ ────▶ │ line 1       │
+     *   │ line 3  bot  │ ──────┼──────────────┼──────▶ line 1
+     *   │     ...      │       │     ...      │          ...
+     *   └──────────────┘       └──────────────┘
+     *    linesize = L           linesize = 2 * L (s->linesize, s->cur_pic)
+     *
      * The MPVPicture pointers stay the same throughout decoding, so derive
      * the work pictures from them instead. The line sizes are set up by
      * ff_mpv_frame_start() in dst itself; quarter_sample and mspel are set
@@ -1209,8 +1254,21 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
     }
 
     /* Frame threading: let the next picture start decoding in another
-     * thread as soon as everything it depends on is known. That is the case
-     * now, except when the software decoding below can still change it:
+     * thread as soon as everything it depends on is known.
+     *
+     *   ┌──────────────────────────────┬──────────────┬──────────────────┐
+     *   │ picture                      │ setup ends   │ reason           │
+     *   ├──────────────────────────────┼──────────────┼──────────────────┤
+     *   │ progressive, interlaced frame│ here         │ header says all  │
+     *   │ field B / BI                 │ here         │ see below        │
+     *   │ field I / P                  │ after decode │ 2nd field header,│
+     *   │                              │              │ mv_f_next swap   │
+     *   │ slices with picture header   │ after decode │ header re-parsed │
+     *   │ hwaccel (any of the above)   │ here         │ hwaccel needs it │
+     *   └──────────────────────────────┴──────────────┴──────────────────┘
+     *
+     * Setup can end here, except when the software decoding below can
+     * still change what later pictures depend on:
      * - The header of the second field of an I/P field picture can update
      *   the intensity compensation state, and the field MV flags that
      *   subsequent field B-pictures predict from are swapped into

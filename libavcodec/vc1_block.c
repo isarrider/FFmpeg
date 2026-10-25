@@ -80,7 +80,20 @@ static inline void update_block_index(MpegEncContext *s)
  *
  * Overlap smoothing and the loop filter trail the decoding loop by up to
  * two MB rows, so only rows above that are reported, with a safety margin.
- * Field pictures are only reported as a whole by ff_mpv_frame_end().
+ * Called after MB row y has been decoded:
+ *
+ *    MB row
+ *   ┌──────┬──────────────────────────────┐
+ *   │ y-4  │██████████████████████████████│ final       ◀─ reported
+ *   │ y-3  │██████████████████████████████│ safety margin
+ *   │ y-2  │▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│ loop filter still running
+ *   │ y-1  │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│ overlap filter, put pixels
+ *   │ y    │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│ just decoded
+ *   └──────┴──────────────────────────────┘
+ *
+ * The rest is reported by ff_mpv_frame_end(), as are field pictures, which
+ * interleave two fields in the same rows. Nothing is reported once an error
+ * occurred, as error concealment may still change any row.
  */
 static void vc1_report_decode_progress(VC1Context *v)
 {
@@ -2889,7 +2902,12 @@ static void vc1_decode_b_blocks(VC1Context *v)
     for (s->mb_y = s->start_mb_y; s->mb_y < s->end_mb_y; s->mb_y++) {
         s->mb_x = 0;
         init_block_index(v);
-        /* direct mode reads the co-located motion of the next anchor */
+        /* Direct mode scales the motion of the co-located MB of the next
+         * anchor, so that row of it must be decoded:
+         *
+         *   this B-picture, MB row y  ───▶  next_pic.motion_val, row y
+         *                                    (+ mb_height / 2 in the second
+         *                                     field, i.e. v->mb_off)      */
         if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME) &&
             s->next_pic.ptr)
             ff_thread_progress_await(&s->next_pic.ptr->progress,
@@ -2952,6 +2970,7 @@ static void vc1_decode_skip_blocks(VC1Context *v)
         s->mb_x = 0;
         init_block_index(v);
         update_block_index(s);
+        /* a skipped picture is a row-by-row copy of the reference */
         if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME))
             ff_thread_progress_await(&s->last_pic.ptr->progress, s->mb_y);
         memcpy(s->dest[0], s->last_pic.data[0] + s->mb_y * 16 * s->linesize,   s->linesize   * 16);
