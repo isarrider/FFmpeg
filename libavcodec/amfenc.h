@@ -100,6 +100,7 @@ typedef struct AMFEncoderContext {
     int                 qvbr_quality_level;
     int                 hw_high_motion_quality_boost;
     int                 forced_idr;
+    int                 qp_stats;
 
     // HEVC - specific options
 
@@ -162,8 +163,6 @@ int ff_amf_receive_packet(AVCodecContext *avctx, AVPacket *avpkt);
 * Supported formats
 */
 extern const enum AVPixelFormat ff_amf_pix_fmts[];
-
-int ff_amf_get_color_profile(AVCodecContext *avctx);
 
 /**
 * Error handling helper

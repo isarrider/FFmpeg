@@ -415,7 +415,8 @@ FATE_PNG += fate-png-int-rgb24
 fate-png-int-rgb24: CMD = framecrc -i $(TARGET_SAMPLES)/png1/lena-int_rgb24.png -sws_flags +accurate_rnd+bitexact
 
 FATE_PNG_PROBE += fate-png-frame-metadata
-fate-png-frame-metadata: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries frame_tags \
+fate-png-frame-metadata: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -f image2 \
+    -export_path_metadata 1 -show_entries frame_tags=gamma,Software,lavf.image2dec.source_basename \
     -i $(TARGET_SAMPLES)/filter/pixelart0.png
 
 FATE_PNG_PROBE += fate-png-side-data
@@ -561,8 +562,13 @@ fate-tiff-zip-rgbaf32le: CMD = framecrc -i $(TARGET_SAMPLES)/tiff/zip_rgbaf32le.
 FATE_TIFF-$(call FRAMECRC, IMAGE2, TIFF, ZLIB) += $(FATE_TIFF_ZIP)
 FATE_TIFF-$(call FRAMECRC, IMAGE2, TIFF) += $(FATE_TIFF)
 
+FATE_TIFF_TRANSCODE-$(call TRANSCODE, TIFF, IMAGE2 IMAGE_TIFF_PIPE, \
+    IMAGE_PNG_PIPE_DEMUXER PNG_DECODER SCALE_FILTER) += fate-tiff-icc
+fate-tiff-icc: CMD = transcode png_pipe $(TARGET_SAMPLES)/png1/lena-int_rgb24.png image2 "-vf scale=1:1 -c:v tiff -compression_algo raw" "" "-show_frames -show_entries frame=side_data_list:frame_tags="
+
 FATE_IMAGE_FRAMECRC += $(FATE_TIFF-yes)
-fate-tiff: $(FATE_TIFF-yes)
+FATE_IMAGE_TRANSCODE += $(FATE_TIFF_TRANSCODE-yes)
+fate-tiff: $(FATE_TIFF-yes) $(FATE_TIFF_TRANSCODE-yes)
 
 FATE_WEBP += fate-webp-rgb-lossless
 fate-webp-rgb-lossless: CMD = framecrc -i $(TARGET_SAMPLES)/webp/rgb_lossless.webp
@@ -589,6 +595,19 @@ FATE_WEBP-$(call DEMDEC, IMAGE2, WEBP) += $(FATE_WEBP)
 FATE_IMAGE_FRAMECRC += $(FATE_WEBP-yes)
 fate-webp: $(FATE_WEBP-yes)
 
+FATE_WEBP_ANIM += fate-webp-anim
+fate-webp-anim: CMD = framecrc -reinit_filter 0 -i $(TARGET_SAMPLES)/webp/anim.webp
+
+FATE_WEBP_ANIM += fate-webp-chfmt1
+fate-webp-chfmt1: CMD = framecrc -reinit_filter 0 -i $(TARGET_SAMPLES)/webp/anim_rgb_yuv.webp
+
+FATE_WEBP_ANIM += fate-webp-chfmt2
+fate-webp-chfmt2: CMD = framecrc -reinit_filter 0 -i $(TARGET_SAMPLES)/webp/anim_yuv_rgb.webp
+
+FATE_WEBP_ANIM-$(call DEMDEC, WEBP_ANIM, WEBP_ANIM) += $(FATE_WEBP_ANIM)
+FATE_IMAGE_FRAMECRC += $(FATE_WEBP_ANIM-yes)
+fate-webp: $(FATE_WEBP_ANIM-yes)
+
 FATE_IMAGE_FRAMECRC-$(call DEMDEC, IMAGE2, XFACE) += fate-xface
 fate-xface: CMD = framecrc -i $(TARGET_SAMPLES)/xface/lena.xface
 
@@ -607,8 +626,31 @@ FATE_IMAGE += $(FATE_IMAGE-yes)
 FATE_IMAGE_PROBE += $(FATE_IMAGE_PROBE-yes)
 FATE_IMAGE_TRANSCODE += $(FATE_IMAGE_TRANSCODE-yes)
 
+FATE_JPEG_MPF-$(call ALLYES, LAVFI_INDEV WRAPPED_AVFRAME_DECODER TESTSRC2_FILTER SCALE_FILTER FORMAT_FILTER \
+    SPLIT_FILTER SETPARAMS_FILTER GAINMAP_FILTER MJPEG_ENCODER JPEG_MPF_MUXER \
+    JPEG_MPF_DEMUXER MJPEG_DECODER RAWVIDEO_ENCODER FRAMECRC_MUXER PIPE_PROTOCOL \
+    FILE_PROTOCOL FFPROBE) += fate-jpeg-mpf-gainmap
+fate-jpeg-mpf-gainmap: tests/data/filtergraphs/jpeg_mpf_gainmap
+fate-jpeg-mpf-gainmap: CMD = transcode lavfi testsrc2=s=64x48:r=1:d=1 jpeg_mpf \
+    "-sws_flags +accurate_rnd+bitexact \
+     -/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/jpeg_mpf_gainmap \
+     -map [base] -map [gain] -stream_group type=gain_map:st=0:st=1:el_index=1 \
+     -pix_fmt yuvj444p -c:v mjpeg -dct int" "-map 0" \
+    "-show_entries stream_group=index,type,nb_streams:stream_group_stream=index:frame=stream_index:frame_side_data_list -of compact"
+
+FATE_FFMPEG_FFPROBE += $(FATE_JPEG_MPF-yes)
+fate-jpeg-mpf: $(FATE_JPEG_MPF-yes)
+
+FATE_IMG2_MUXER-$(call ALLYES, LAVFI_INDEV COLOR_FILTER FORMAT_FILTER \
+    PGM_ENCODER IMAGE2_MUXER IMAGE2_DEMUXER FILE_PROTOCOL FFPROBE) \
+    += fate-img2-update-filemtime
+fate-img2-update-filemtime: CMD = img2_update_filemtime
+fate-img2-update-filemtime: REF = $(SRC_PATH)/tests/ref/fate/img2-update-filemtime
+
+FATE_FFMPEG_FFPROBE += $(FATE_IMG2_MUXER-yes)
+
 FATE_SAMPLES_FFMPEG += $(FATE_IMAGE)
 FATE_SAMPLES_FFPROBE += $(FATE_IMAGE_PROBE)
 FATE_SAMPLES_FFMPEG_FFPROBE += $(FATE_IMAGE_TRANSCODE)
 
-fate-image: $(FATE_IMAGE) $(FATE_IMAGE_PROBE) $(FATE_IMAGE_TRANSCODE)
+fate-image: $(FATE_IMAGE) $(FATE_IMAGE_PROBE) $(FATE_IMAGE_TRANSCODE) $(FATE_IMG2_MUXER-yes) $(FATE_JPEG_MPF-yes)

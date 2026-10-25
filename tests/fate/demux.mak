@@ -7,6 +7,9 @@ fate-adts-id3v1-demux: CMD = framecrc -f aac -i $(TARGET_SAMPLES)/aac/id3v1.aac 
 fate-adts-id3v2-demux: CMD = framecrc -f aac -i $(TARGET_SAMPLES)/aac/id3v2.aac -c:a copy
 fate-adts-id3v2-two-tags-demux: CMD = framecrc -i $(TARGET_SAMPLES)/aac/id3v2_two_tags.aac -c:a copy
 
+FATE_FFPROBE_DEMUX-$(call DEMDEC, AAC, AAC) += fate-adts-noparse-demux
+fate-adts-noparse-demux: CMD = ffprobe_demux $(TARGET_SAMPLES)/aac/id3v1.aac -f aac -fflags +noparse
+
 FATE_SAMPLES_DEMUX-$(call FRAMECRC, AA,, SIPR_PARSER) += fate-aa-demux
 fate-aa-demux: CMD = framecrc -i $(TARGET_SAMPLES)/aa/bush.aa -c:a copy
 
@@ -175,8 +178,77 @@ fate-ts-demux: CMD = ffprobe_demux $(TARGET_SAMPLES)/ac3/mp3ac325-4864-small.ts
 FATE_FFPROBE_DEMUX-$(CONFIG_MPEGTS_DEMUXER) += fate-ts-timed-id3-demux
 fate-ts-timed-id3-demux: CMD = ffprobe_demux $(TARGET_SAMPLES)/mpegts/id3.ts
 
+tests/data/id3.ts: TAG = GEN
+tests/data/id3.ts: $(SAMPLES)/mpegts/id3.ts | tests/data
+	$(Q)cp $< $@
+
+tests/data/id3.m3u8: tests/data/id3.ts | tests/data
+	$(Q)printf '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nid3.ts\n#EXT-X-ENDLIST\n' > $@
+
+FATE_FFPROBE_DEMUX-$(call DEMDEC, MPEGTS HLS) += fate-ts-timed-id3-hls-demux
+fate-ts-timed-id3-hls-demux: tests/data/id3.m3u8
+fate-ts-timed-id3-hls-demux: CMD = ffprobe_demux $(TARGET_PATH)/tests/data/id3.m3u8
+
+tests/data/hls-webvtt.m3u8: TAG = GEN
+tests/data/hls-webvtt.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
+        -f lavfi -i "aevalsrc=0:d=6" -c:a mp2fixed -flags +bitexact -muxdelay 0 -muxpreload 0 \
+        -f hls -hls_time 2 -hls_list_size 0 \
+        -hls_segment_filename $(TARGET_PATH)/tests/data/hls-webvtt-a%d.ts \
+        $(TARGET_PATH)/tests/data/hls-webvtt-a.m3u8 2>/dev/null
+	$(Q)printf '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nhls-webvtt-s0.vtt\n#EXTINF:2,\nhls-webvtt-s1.vtt\n#EXTINF:2,\nhls-webvtt-s2.vtt\n#EXT-X-ENDLIST\n' > tests/data/hls-webvtt-s.m3u8
+	$(Q)printf 'WEBVTT\n\n00:00.500 --> 00:01.500\nfirst\n' > tests/data/hls-webvtt-s0.vtt
+	$(Q)printf 'WEBVTT\n\n00:02.500 --> 00:03.500\nsecond\n' > tests/data/hls-webvtt-s1.vtt
+	$(Q)printf 'WEBVTT\n\n00:04.500 --> 00:05.500\nthird\n' > tests/data/hls-webvtt-s2.vtt
+	$(Q)printf '#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",NAME="en",URI="hls-webvtt-s.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=64000,SUBTITLES="s"\nhls-webvtt-a.m3u8\n' > $@
+
+FATE_FFMPEG-$(call FILTERDEMDECENCMUX, AEVALSRC ARESAMPLE, HLS MPEGTS WEBVTT, MP2 PCM_F64LE, MP2FIXED, HLS MPEGTS NULL WEBVTT, LAVFI_INDEV MPEGAUDIO_PARSER PIPE_PROTOCOL) += fate-hls-webvtt-demux
+fate-hls-webvtt-demux: tests/data/hls-webvtt.m3u8
+fate-hls-webvtt-demux: CLEANFILES = tests/data/hls-webvtt*.m3u8 tests/data/hls-webvtt-*.ts tests/data/hls-webvtt-*.vtt
+fate-hls-webvtt-demux: CMD = fmtstdout webvtt -copyts -i $(TARGET_PATH)/tests/data/hls-webvtt.m3u8 -map 0:a -c copy -f null - -map 0:s -c copy
+
+tests/data/hls-self-variant.m3u8: TAG = GEN
+tests/data/hls-self-variant.m3u8: | tests/data
+	$(Q)printf '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=64000\nhls-self-variant.m3u8\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",NAME="en",URI="hls-self-variant-missing.m3u8"\n#EXTINF:2,\nhls-self-variant.vtt\n' > $@
+
+FATE_FFPROBE-$(call DEMDEC, HLS) += fate-hls-self-variant-demux
+fate-hls-self-variant-demux: tests/data/hls-self-variant.m3u8
+fate-hls-self-variant-demux: CLEANFILES = tests/data/hls-self-variant.m3u8
+fate-hls-self-variant-demux: CMD = ffprobe_demux $(TARGET_PATH)/tests/data/hls-self-variant.m3u8
+
+tests/data/hls-shared-renditions.m3u8: TAG = GEN
+tests/data/hls-shared-renditions.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
+        -f lavfi -i "aevalsrc=0:s=16000:d=2" -c:a mp2fixed -flags +bitexact -muxdelay 0 -muxpreload 0 \
+        -f hls -hls_time 2 -hls_list_size 0 \
+        -hls_segment_filename $(TARGET_PATH)/tests/data/hls-shared-renditions-a%d.ts \
+        $(TARGET_PATH)/tests/data/hls-shared-renditions-a.m3u8 2>/dev/null
+	$(Q)printf '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nhls-shared-renditions-s0.vtt\n#EXT-X-ENDLIST\n' > tests/data/hls-shared-renditions-s.m3u8
+	$(Q)printf 'WEBVTT\n\n00:00.500 --> 00:01.500\nfirst\n' > tests/data/hls-shared-renditions-s0.vtt
+	$(Q)printf '#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="g",NAME="German",LANGUAGE="de",URI="hls-shared-renditions-s.m3u8"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="g",NAME="English",LANGUAGE="en",DEFAULT=YES\n#EXT-X-STREAM-INF:BANDWIDTH=64000,AUDIO="g",SUBTITLES="g"\nhls-shared-renditions-a.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=128000,AUDIO="g",SUBTITLES="g"\nhls-shared-renditions-a.m3u8\n' > $@
+
+FATE_HLS_SHARED_RENDITIONS-$(call FILTERDEMDECENCMUX, AEVALSRC ARESAMPLE, HLS MPEGTS WEBVTT, MP3FLOAT PCM_F64LE, MP2FIXED, HLS MPEGTS, LAVFI_INDEV MPEGAUDIO_PARSER) += fate-hls-shared-renditions-demux
+FATE_FFMPEG_FFPROBE += $(FATE_HLS_SHARED_RENDITIONS-yes)
+fate-hls-shared-renditions-demux: tests/data/hls-shared-renditions.m3u8
+fate-hls-shared-renditions-demux: CLEANFILES = tests/data/hls-shared-renditions*.m3u8 tests/data/hls-shared-renditions-*.ts tests/data/hls-shared-renditions-*.vtt
+fate-hls-shared-renditions-demux: CMD = ffprobe_demux $(TARGET_PATH)/tests/data/hls-shared-renditions.m3u8 -show_programs
+
 FATE_SAMPLES_DEMUX-$(call PARSERDEM, JPEGXS, IMAGE_JPEGXS_PIPE, CONCAT_PROTOCOL) += fate-jxs-concat-demux
 fate-jxs-concat-demux: CMD = framecrc "-i concat:$(TARGET_SAMPLES)/jxs/lena.jxs|$(TARGET_SAMPLES)/jxs/lena.jxs -c:v copy"
+
+# 21-byte crafted VPK: header parses (nb_channels=80) but adpcm_psx open
+# fails. After find_stream_info the layout must stay 80, not 0.
+# ffprobe cannot be used: it aborts on the failed decoder open before
+# printing -show_entries.
+tests/data/vpk-div0.vpk: TAG = GEN
+tests/data/vpk-div0.vpk: | tests/data
+	$(Q)printf '\040\113\120\126\126\120\000\370\004\000\073\003\141\071\126\062\066\066\060\070\120' > $@
+
+FATE_FFMPEG-$(call ALLYES, VPK_DEMUXER ADPCM_PSX_DECODER FILE_PROTOCOL NULL_MUXER) += fate-demux-vpk-div0
+fate-demux-vpk-div0: tests/data/vpk-div0.vpk
+fate-demux-vpk-div0: CMD = ffmpeg -i $(TARGET_PATH)/tests/data/vpk-div0.vpk -map 0 -c copy -f null -
+fate-demux-vpk-div0: CMP = grep
+fate-demux-vpk-div0: REF = 80 channels
 
 FATE_SAMPLES_DEMUX += $(FATE_SAMPLES_DEMUX-yes)
 FATE_SAMPLES_FFMPEG += $(FATE_SAMPLES_DEMUX)

@@ -22,6 +22,7 @@
 
 #define COBJMACROS
 
+#include "libavutil/fifo.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
@@ -34,22 +35,27 @@
 #define MAX_REFERENCES 8
 
 /**
- * Deinterlace mode enumeration
+ * Deinterlace method enumeration
  * Maps to D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG values
  */
-enum DeinterlaceD3D12Mode {
-    DEINT_D3D12_MODE_DEFAULT        = 0,  // Use best available mode
-    DEINT_D3D12_MODE_BOB            = 1,  // Bob deinterlacing (simple field interpolation)
-    DEINT_D3D12_MODE_CUSTOM         = 2,  // Driver-defined advanced deinterlacing
+enum DeinterlaceD3D12Method {
+    DEINT_D3D12_METHOD_DEFAULT      = 0,  // Use best available method
+    DEINT_D3D12_METHOD_BOB          = 1,  // Bob deinterlacing (simple field interpolation)
+    DEINT_D3D12_METHOD_CUSTOM       = 2,  // Driver-defined advanced deinterlacing
 };
+
+typedef struct CommandAllocator {
+    ID3D12CommandAllocator *command_allocator;
+    UINT64 fence_value;
+} CommandAllocator;
 
 typedef struct DeinterlaceD3D12Context {
     const AVClass *classCtx;
 
     /* Filter options */
-    int mode;           // Deinterlace mode (default, bob, custom)
-    int field_rate;     // Output field rate (1 = frame rate, 2 = field rate)
-    int auto_enable;    // Only deinterlace interlaced frames
+    int method;         // Deinterlace method (default, bob, custom)
+    int mode;           // Output mode (0 = frame rate, 1 = field rate)
+    int deint;          // Which frames to deinterlace (0 = all, 1 = interlaced only)
 
     /* D3D12 objects */
     ID3D12Device *device;
@@ -57,7 +63,8 @@ typedef struct DeinterlaceD3D12Context {
     ID3D12VideoProcessor *video_processor;
     ID3D12CommandQueue *command_queue;
     ID3D12VideoProcessCommandList *command_list;
-    ID3D12CommandAllocator *command_allocator;
+
+    AVFifo *allocator_queue;
 
     /* Synchronization */
     ID3D12Fence *fence;
@@ -101,8 +108,45 @@ typedef struct DeinterlaceD3D12Context {
 static av_cold int deint_d3d12_init(AVFilterContext *ctx)
 {
     DeinterlaceD3D12Context *s = ctx->priv;
-    s->fence_value = 1;
     s->processor_configured = 0;
+    return 0;
+}
+
+static int deint_d3d12_get_valid_command_allocator(DeinterlaceD3D12Context *s, AVFilterContext *ctx,
+                                                    ID3D12CommandAllocator **ppAllocator)
+{
+    HRESULT hr;
+    CommandAllocator allocator;
+
+    if (av_fifo_peek(s->allocator_queue, &allocator, 1, 0) >= 0) {
+        UINT64 completed = ID3D12Fence_GetCompletedValue(s->fence);
+        if (completed >= allocator.fence_value) {
+            *ppAllocator = allocator.command_allocator;
+            av_fifo_read(s->allocator_queue, &allocator, 1);
+            return 0;
+        }
+    }
+
+    hr = ID3D12Device_CreateCommandAllocator(s->device, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
+                                             &IID_ID3D12CommandAllocator, (void **)ppAllocator);
+    if (FAILED(hr)) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to create command allocator: HRESULT 0x%lX\n", hr);
+        return AVERROR_EXTERNAL;
+    }
+
+    return 0;
+}
+
+static int deint_d3d12_discard_command_allocator(DeinterlaceD3D12Context *s, ID3D12CommandAllocator *pAllocator,
+                                                  UINT64 fence_value)
+{
+    CommandAllocator allocator = {
+        .command_allocator = pAllocator,
+        .fence_value       = fence_value,
+    };
+
+    av_fifo_write(s->allocator_queue, &allocator, 1);
+
     return 0;
 }
 
@@ -110,6 +154,7 @@ static void release_d3d12_resources(DeinterlaceD3D12Context *s)
 {
     UINT64 fence_value;
     HRESULT hr;
+    CommandAllocator allocator;
 
     /* Wait for all GPU operations to complete before releasing resources */
     if (s->command_queue && s->fence && s->fence_event) {
@@ -141,9 +186,10 @@ static void release_d3d12_resources(DeinterlaceD3D12Context *s)
         s->command_list = NULL;
     }
 
-    if (s->command_allocator) {
-        ID3D12CommandAllocator_Release(s->command_allocator);
-        s->command_allocator = NULL;
+    if (s->allocator_queue) {
+        while (av_fifo_read(s->allocator_queue, &allocator, 1) >= 0)
+            ID3D12CommandAllocator_Release(allocator.command_allocator);
+        av_fifo_freep2(&s->allocator_queue);
     }
 
     if (s->video_processor) {
@@ -220,42 +266,42 @@ static AVRational get_input_framerate(AVFilterContext *ctx, AVFilterLink *inlink
     return framerate;
 }
 
-static D3D12_VIDEO_PROCESS_DEINTERLACE_FLAGS get_deint_mode(DeinterlaceD3D12Context *s,
+static D3D12_VIDEO_PROCESS_DEINTERLACE_FLAGS get_deint_method(DeinterlaceD3D12Context *s,
                                                              AVFilterContext *ctx)
 {
-    D3D12_VIDEO_PROCESS_DEINTERLACE_FLAGS mode_flag;
+    D3D12_VIDEO_PROCESS_DEINTERLACE_FLAGS method_flag;
 
-    switch (s->mode) {
-    case DEINT_D3D12_MODE_BOB:
-        mode_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
+    switch (s->method) {
+    case DEINT_D3D12_METHOD_BOB:
+        method_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
         break;
-    case DEINT_D3D12_MODE_CUSTOM:
-        mode_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM;
+    case DEINT_D3D12_METHOD_CUSTOM:
+        method_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM;
         break;
-    case DEINT_D3D12_MODE_DEFAULT:
+    case DEINT_D3D12_METHOD_DEFAULT:
     default:
-        /* Select best available mode */
+        /* Select best available method */
         if (s->supported_deint_flags & D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM) {
-            mode_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM;
+            method_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM;
             av_log(ctx, AV_LOG_VERBOSE, "Using custom (driver-defined) deinterlacing\n");
         } else if (s->supported_deint_flags & D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB) {
-            mode_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
+            method_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
             av_log(ctx, AV_LOG_VERBOSE, "Using bob deinterlacing\n");
         } else {
-            mode_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
-            av_log(ctx, AV_LOG_WARNING, "No deinterlacing modes reported, trying bob\n");
+            method_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
+            av_log(ctx, AV_LOG_WARNING, "No deinterlacing methods reported, trying bob\n");
         }
         break;
     }
 
-    /* Verify requested mode is supported */
-    if (mode_flag != D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB &&
-        !(s->supported_deint_flags & mode_flag)) {
-        av_log(ctx, AV_LOG_WARNING, "Requested deinterlace mode not supported, falling back to bob\n");
-        mode_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
+    /* Verify requested method is supported */
+    if (method_flag != D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB &&
+        !(s->supported_deint_flags & method_flag)) {
+        av_log(ctx, AV_LOG_WARNING, "Requested deinterlace method not supported, falling back to bob\n");
+        method_flag = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
     }
 
-    return mode_flag;
+    return method_flag;
 }
 
 static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
@@ -263,10 +309,12 @@ static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
                                             AVFrame *in)
 {
     HRESULT hr;
+    int ret;
     AVHWDeviceContext *hwctx = (AVHWDeviceContext *)s->hw_device_ctx->data;
     AVD3D12VADeviceContext *d3d12_hwctx = (AVD3D12VADeviceContext *)hwctx->hwctx;
-    D3D12_VIDEO_PROCESS_DEINTERLACE_FLAGS deint_mode;
+    D3D12_VIDEO_PROCESS_DEINTERLACE_FLAGS deint_method;
     D3D12_VIDEO_FIELD_TYPE field_type;
+    ID3D12CommandAllocator *command_allocator = NULL;
 
     s->device = d3d12_hwctx->device;
 
@@ -314,7 +362,7 @@ static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
 
     s->process_support.OutputFormat.Format           = s->input_format;
     s->process_support.OutputFormat.ColorSpace       = s->input_colorspace;
-    s->process_support.OutputFrameRate.Numerator     = s->input_framerate.num * s->field_rate;
+    s->process_support.OutputFrameRate.Numerator     = s->input_framerate.num * (s->mode + 1);
     s->process_support.OutputFrameRate.Denominator   = s->input_framerate.den;
     s->process_support.OutputStereoFormat            = D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE;
 
@@ -342,21 +390,21 @@ static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
 
     if (!(s->supported_deint_flags & (D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB |
                                        D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM))) {
-        av_log(ctx, AV_LOG_ERROR, "No deinterlacing modes supported by hardware\n");
+        av_log(ctx, AV_LOG_ERROR, "No deinterlacing methods supported by hardware\n");
         return AVERROR(ENOSYS);
     }
 
-    deint_mode = get_deint_mode(s, ctx);
+    deint_method = get_deint_method(s, ctx);
 
     /* Query reference frame requirements from hardware */
 #if CONFIG_D3D12_VIDEO_PROCESS_REFERENCE_INFO
     D3D12_FEATURE_DATA_VIDEO_PROCESS_REFERENCE_INFO ref_info = {
         .NodeIndex          = 0,
-        .DeinterlaceMode    = deint_mode,
+        .DeinterlaceMode    = deint_method,
         .Filters            = D3D12_VIDEO_PROCESS_FILTER_FLAG_NONE,
         .FeatureSupport     = D3D12_VIDEO_PROCESS_FEATURE_FLAG_NONE,
         .InputFrameRate     = { s->input_framerate.num, s->input_framerate.den },
-        .OutputFrameRate    = { s->input_framerate.num * s->field_rate, s->input_framerate.den },
+        .OutputFrameRate    = { s->input_framerate.num * (s->mode + 1), s->input_framerate.den },
         .EnableAutoProcessing = FALSE,
     };
 
@@ -376,18 +424,18 @@ static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
     } else {
         av_log(ctx, AV_LOG_WARNING,
                 "Failed to query reference info (HRESULT 0x%lX), using defaults\n", hr);
-        s->num_past_frames   = (deint_mode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM) ? 1 : 0;
+        s->num_past_frames   = (deint_method == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM) ? 1 : 0;
         s->num_future_frames = 0;
     }
 #else
     av_log(ctx, AV_LOG_VERBOSE,
            "Reference info query not available in SDK, using defaults\n");
-    s->num_past_frames   = (deint_mode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM) ? 1 : 0;
+    s->num_past_frames   = (deint_method == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM) ? 1 : 0;
     s->num_future_frames = 0;
 #endif
 
     /* May need 1 extra slot for PTS calculation.*/
-    s->extra_delay_for_timestamps = (s->field_rate == 2 && s->num_future_frames == 0) ? 1 : 0;
+    s->extra_delay_for_timestamps = (s->mode && s->num_future_frames == 0) ? 1 : 0;
 
     s->queue_depth = s->num_past_frames + s->num_future_frames + s->extra_delay_for_timestamps + 1;
 
@@ -409,7 +457,7 @@ static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
         .AlphaFillMode                  = D3D12_VIDEO_PROCESS_ALPHA_FILL_MODE_OPAQUE,
         .AlphaFillModeSourceStreamIndex = 0,
         .BackgroundColor                = { 0.0f, 0.0f, 0.0f, 1.0f },
-        .FrameRate                      = { s->input_framerate.num * s->field_rate, s->input_framerate.den },
+        .FrameRate                      = { s->input_framerate.num * (s->mode + 1), s->input_framerate.den },
         .EnableStereo                   = FALSE,
     };
 
@@ -421,7 +469,7 @@ static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
         .FrameRate              = { s->input_framerate.num, s->input_framerate.den },
         .StereoFormat           = D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE,
         .FieldType              = field_type,
-        .DeinterlaceMode        = deint_mode,
+        .DeinterlaceMode        = deint_method,
         .EnableOrientation      = FALSE,
         .FilterFlags            = D3D12_VIDEO_PROCESS_FILTER_FLAG_NONE,
         .SourceSizeRange        = {
@@ -458,35 +506,6 @@ static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
         return AVERROR_EXTERNAL;
     }
 
-    hr = ID3D12Device_CreateCommandAllocator(
-        s->device,
-        D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
-        &IID_ID3D12CommandAllocator,
-        (void **)&s->command_allocator
-    );
-
-    if (FAILED(hr)) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to create command allocator: HRESULT 0x%lX\n", hr);
-        return AVERROR_EXTERNAL;
-    }
-
-    hr = ID3D12Device_CreateCommandList(
-        s->device,
-        0,
-        D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
-        s->command_allocator,
-        NULL,
-        &IID_ID3D12VideoProcessCommandList,
-        (void **)&s->command_list
-    );
-
-    if (FAILED(hr)) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to create command list: HRESULT 0x%lX\n", hr);
-        return AVERROR_EXTERNAL;
-    }
-
-    ID3D12VideoProcessCommandList_Close(s->command_list);
-
     hr = ID3D12Device_CreateFence(s->device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&s->fence);
     if (FAILED(hr)) {
         av_log(ctx, AV_LOG_ERROR, "Failed to create fence: HRESULT 0x%lX\n", hr);
@@ -500,6 +519,36 @@ static int deint_d3d12_configure_processor(DeinterlaceD3D12Context *s,
         av_log(ctx, AV_LOG_ERROR, "Failed to create fence event\n");
         return AVERROR_EXTERNAL;
     }
+
+    s->allocator_queue = av_fifo_alloc2(2, sizeof(CommandAllocator), AV_FIFO_FLAG_AUTO_GROW);
+    if (!s->allocator_queue)
+        return AVERROR(ENOMEM);
+
+    ret = deint_d3d12_get_valid_command_allocator(s, ctx, &command_allocator);
+    if (ret < 0)
+        return ret;
+
+    hr = ID3D12Device_CreateCommandList(
+        s->device,
+        0,
+        D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
+        command_allocator,
+        NULL,
+        &IID_ID3D12VideoProcessCommandList,
+        (void **)&s->command_list
+    );
+
+    if (FAILED(hr)) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to create command list: HRESULT 0x%lX\n", hr);
+        ID3D12CommandAllocator_Release(command_allocator);
+        return AVERROR_EXTERNAL;
+    }
+
+    ID3D12VideoProcessCommandList_Close(s->command_list);
+
+    ret = deint_d3d12_discard_command_allocator(s, command_allocator, 0);
+    if (ret < 0)
+        return ret;
 
     s->processor_configured = 1;
     av_log(ctx, AV_LOG_VERBOSE, "D3D12 deinterlace processor successfully configured\n");
@@ -534,6 +583,7 @@ static int deint_d3d12_process_frame(AVFilterContext *ctx,
     int ret = 0;
     int i;
     HRESULT hr;
+    ID3D12CommandAllocator *command_allocator = NULL;
 
     AVD3D12VAFrame *in_d3d12_frame = (AVD3D12VAFrame *)input_frame->data[0];
 
@@ -638,14 +688,18 @@ static int deint_d3d12_process_frame(AVFilterContext *ctx,
         }
     }
 
-    hr = ID3D12CommandAllocator_Reset(s->command_allocator);
+    ret = deint_d3d12_get_valid_command_allocator(s, ctx, &command_allocator);
+    if (ret < 0)
+        goto fail;
+
+    hr = ID3D12CommandAllocator_Reset(command_allocator);
     if (FAILED(hr)) {
         av_log(ctx, AV_LOG_ERROR, "Failed to reset command allocator: HRESULT 0x%lX\n", hr);
         ret = AVERROR_EXTERNAL;
         goto fail;
     }
 
-    hr = ID3D12VideoProcessCommandList_Reset(s->command_list, s->command_allocator);
+    hr = ID3D12VideoProcessCommandList_Reset(s->command_list, command_allocator);
     if (FAILED(hr)) {
         av_log(ctx, AV_LOG_ERROR, "Failed to reset command list: HRESULT 0x%lX\n", hr);
         ret = AVERROR_EXTERNAL;
@@ -742,6 +796,11 @@ static int deint_d3d12_process_frame(AVFilterContext *ctx,
     out_d3d12_frame->sync_ctx.fence_value = s->fence_value;
     ID3D12Fence_AddRef(s->fence);
 
+    ret = deint_d3d12_discard_command_allocator(s, command_allocator, s->fence_value);
+    command_allocator = NULL;
+    if (ret < 0)
+        goto fail;
+
     s->fence_value++;
 
     ret = av_frame_copy_props(out, input_frame);
@@ -756,7 +815,7 @@ static int deint_d3d12_process_frame(AVFilterContext *ctx,
     out->flags &= ~AV_FRAME_FLAG_INTERLACED;
 
     /* Calculate output PTS for field rate output */
-    if (s->field_rate == 2 && queue_idx >= 0) {
+    if (s->mode && queue_idx >= 0) {
         AVFrame *next_frame = (queue_idx + 1 < s->queue_count) ?
                               s->frame_queue[queue_idx + 1] : NULL;
 
@@ -775,6 +834,8 @@ static int deint_d3d12_process_frame(AVFilterContext *ctx,
     return ff_filter_frame(outlink, out);
 
 fail:
+    if (command_allocator)
+        deint_d3d12_discard_command_allocator(s, command_allocator, s->fence_value);
     av_frame_free(&out);
     return ret;
 }
@@ -816,7 +877,7 @@ static int deint_d3d12_filter_frame(AVFilterLink *inlink, AVFrame *in)
             while (flush_idx < s->queue_count) {
                 input_frame = s->frame_queue[flush_idx];
                 if (input_frame) {
-                    for (field = 0; field < s->field_rate; field++) {
+                    for (field = 0; field <= s->mode; field++) {
                         ret = deint_d3d12_process_frame(ctx, outlink, input_frame, field, flush_idx);
                         if (ret < 0)
                             return ret;
@@ -877,8 +938,8 @@ static int deint_d3d12_filter_frame(AVFilterLink *inlink, AVFrame *in)
         }
     }
 
-    /* Auto mode: pass through progressive frames by processing them as-is */
-    if (s->auto_enable && !(in->flags & AV_FRAME_FLAG_INTERLACED)) {
+    /* interlaced : pass through progressive frames by processing them as-is */
+    if (s->deint && !(in->flags & AV_FRAME_FLAG_INTERLACED)) {
         av_log(ctx, AV_LOG_DEBUG, "Progressive frame, processing as pass-through\n");
         ret = deint_d3d12_process_frame(ctx, outlink, in, 0, -1);
         av_frame_free(&in);
@@ -887,11 +948,11 @@ static int deint_d3d12_filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     /* Queue management and frame processing.
      *
-     * For bob mode, the hardware typically needs no reference frames
+     * For bob method, the hardware typically needs no reference frames
      * (past=0, future=0), so queue_depth=1 and every input frame is
      * processed immediately -- simple frame-in, frame-out.
      *
-     * For custom (driver-defined) mode, the hardware uses temporal
+     * For custom (driver-defined) method, the hardware uses temporal
      * reference frames for higher-quality motion-adaptive deinterlacing.
      * The queue possible holds past, current, and future reference frames:
      * The queue is managed in four phases:
@@ -904,7 +965,7 @@ static int deint_d3d12_filter_frame(AVFilterLink *inlink, AVFrame *in)
      *   4. EOF flush: process remaining frames after current_frame_index,
      *      or all buffered frames if the queue never filled (short stream)
      *
-     * When queue_depth=1 (bob mode), phases 1, 2, and 4 are effectively
+     * When queue_depth=1 (bob method), phases 1, 2, and 4 are effectively
      * skipped, and only the steady-state path executes.
      */
 
@@ -923,7 +984,7 @@ static int deint_d3d12_filter_frame(AVFilterLink *inlink, AVFrame *in)
             input_frame = s->frame_queue[i];
             if (!input_frame)
                 continue;
-            for (field = 0; field < s->field_rate; field++) {
+            for (field = 0; field <= s->mode; field++) {
                 ret = deint_d3d12_process_frame(ctx, outlink, input_frame, field, i);
                 if (ret < 0)
                     return ret;
@@ -946,7 +1007,7 @@ static int deint_d3d12_filter_frame(AVFilterLink *inlink, AVFrame *in)
     if (!input_frame)
         return 0;
 
-    for (field = 0; field < s->field_rate; field++) {
+    for (field = 0; field <= s->mode; field++) {
         ret = deint_d3d12_process_frame(ctx, outlink, input_frame, field, s->current_frame_index);
         if (ret < 0)
             break;
@@ -1000,8 +1061,8 @@ static int deint_d3d12_config_output(AVFilterLink *outlink)
     s->height  = inlink->h;
 
     /* Adjust time base and frame rate for field rate output */
-    outlink->time_base = av_mul_q(inlink->time_base, (AVRational){ 1, s->field_rate });
-    outl->frame_rate   = av_mul_q(inl->frame_rate, (AVRational){ s->field_rate, 1 });
+    outlink->time_base = av_mul_q(inlink->time_base, (AVRational){ 1, s->mode + 1 });
+    outl->frame_rate   = av_mul_q(inl->frame_rate, (AVRational){ s->mode + 1, 1 });
 
     if (!inl->hw_frames_ctx) {
         av_log(ctx, AV_LOG_ERROR, "No hw_frames_ctx available on input link\n");
@@ -1047,8 +1108,8 @@ static int deint_d3d12_config_output(AVFilterLink *outlink)
     if (!outl->hw_frames_ctx)
         return AVERROR(ENOMEM);
 
-    av_log(ctx, AV_LOG_VERBOSE, "D3D12 deinterlace config: %dx%d, field_rate=%d\n",
-           outlink->w, outlink->h, s->field_rate);
+    av_log(ctx, AV_LOG_VERBOSE, "D3D12 deinterlace config: %dx%d, mode=%s\n",
+           outlink->w, outlink->h, s->mode ? "field" : "frame");
 
     return 0;
 }
@@ -1085,25 +1146,29 @@ static const AVFilterPad deint_d3d12_outputs[] = {
 #define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
 
 static const AVOption deinterlace_d3d12_options[] = {
-    { "mode", "Deinterlacing mode",
-      OFFSET(mode), AV_OPT_TYPE_INT, { .i64 = DEINT_D3D12_MODE_DEFAULT },
-      DEINT_D3D12_MODE_DEFAULT, DEINT_D3D12_MODE_CUSTOM, FLAGS, .unit = "mode" },
-    { "default", "Use best available deinterlacing mode",
-      0, AV_OPT_TYPE_CONST, { .i64 = DEINT_D3D12_MODE_DEFAULT }, 0, 0, FLAGS, .unit = "mode" },
+    { "method", "Deinterlacing method",
+      OFFSET(method), AV_OPT_TYPE_INT, { .i64 = DEINT_D3D12_METHOD_DEFAULT },
+      DEINT_D3D12_METHOD_DEFAULT, DEINT_D3D12_METHOD_CUSTOM, FLAGS, .unit = "method" },
+    { "default", "Use best available deinterlacing method",
+      0, AV_OPT_TYPE_CONST, { .i64 = DEINT_D3D12_METHOD_DEFAULT }, 0, 0, FLAGS, .unit = "method" },
     { "bob", "Bob deinterlacing (simple field interpolation)",
-      0, AV_OPT_TYPE_CONST, { .i64 = DEINT_D3D12_MODE_BOB }, 0, 0, FLAGS, .unit = "mode" },
+      0, AV_OPT_TYPE_CONST, { .i64 = DEINT_D3D12_METHOD_BOB }, 0, 0, FLAGS, .unit = "method" },
     { "custom", "Driver-defined advanced deinterlacing",
-      0, AV_OPT_TYPE_CONST, { .i64 = DEINT_D3D12_MODE_CUSTOM }, 0, 0, FLAGS, .unit = "mode" },
+      0, AV_OPT_TYPE_CONST, { .i64 = DEINT_D3D12_METHOD_CUSTOM }, 0, 0, FLAGS, .unit = "method" },
 
-    { "rate", "Generate output at frame rate or field rate",
-      OFFSET(field_rate), AV_OPT_TYPE_INT, { .i64 = 1 }, 1, 2, FLAGS, .unit = "rate" },
-    { "frame", "Output at frame rate (one frame for each field-pair)",
-      0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, FLAGS, .unit = "rate" },
-    { "field", "Output at field rate (one frame for each field)",
-      0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, FLAGS, .unit = "rate" },
+    { "mode", "Specify the interlacing mode",
+      OFFSET(mode), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS, .unit = "mode" },
+    { "frame", "Send one frame for each frame",
+      0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, FLAGS, .unit = "mode" },
+    { "field", "Send one frame for each field",
+      0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, FLAGS, .unit = "mode" },
 
-    { "auto", "Only deinterlace interlaced frames, pass through progressive",
-      OFFSET(auto_enable), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+    { "deint", "Specify which frames to deinterlace",
+      OFFSET(deint), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS, .unit = "deint" },
+    { "all", "Deinterlace all frames",
+      0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, FLAGS, .unit = "deint" },
+    { "interlaced", "Only deinterlace frames marked as interlaced",
+      0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, FLAGS, .unit = "deint" },
 
     { NULL }
 };

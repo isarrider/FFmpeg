@@ -18,6 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <string.h>
 
 #include "libavutil/mem_internal.h"
 #include "libavcodec/pngdsp.h"
@@ -38,8 +39,8 @@ static void check_add_bytes_l2(const PNGDSPContext *c)
     LOCAL_ALIGNED_16(uint8_t, dst1, [BUF_SIZE]);
     LOCAL_ALIGNED_16(uint8_t, src, [2], [BUF_SIZE]);
 
-    declare_func_emms(AV_CPU_FLAG_MMX, void, uint8_t * dst, const uint8_t *src1,
-                      const uint8_t *src2, int w);
+    declare_func(void, uint8_t * dst, const uint8_t *src1,
+                       const uint8_t *src2, int w);
 
     randomize_buf(dst0, BUF_SIZE);
     memcpy(dst1, dst0, BUF_SIZE);
@@ -69,8 +70,8 @@ static void check_add_paeth_prediction(const PNGDSPContext *c)
     randomize_buf(src, BUF_SIZE);
     randomize_buf(top_buf, BUF_SIZE);
 
-    declare_func_emms(AV_CPU_FLAG_MMX, void, uint8_t * dst, const uint8_t *src,
-                      const uint8_t *top, int w, int bpp);
+    declare_func(void, uint8_t * dst, const uint8_t *src,
+                       const uint8_t *top, int w, int bpp);
 
     const int bpps[] = {3, 4, 6, 8};
     for (int i = 0; i < FF_ARRAY_ELEMS(bpps); i++) {

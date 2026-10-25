@@ -44,6 +44,7 @@ typedef struct TFModel {
     SafeQueue *request_queue;
     Queue *lltask_queue;
     Queue *task_queue;
+    int nb_requests;
 } TFModel;
 
 /**
@@ -140,15 +141,20 @@ static TFInferRequest *tf_create_inference_request(void)
 static int tf_start_inference(void *args)
 {
     TFRequestItem *request = args;
-    TFInferRequest *infer_request = request->infer_request;
-    LastLevelTaskItem *lltask = request->lltask;
-    TaskItem *task = lltask->task;
-    TFModel *tf_model = task->model;
+    TFInferRequest *infer_request;
+    LastLevelTaskItem *lltask;
+    TaskItem *task;
+    TFModel *tf_model;
 
     if (!request) {
-        av_log(tf_model->ctx, AV_LOG_ERROR, "TFRequestItem is NULL\n");
+        av_log(NULL, AV_LOG_ERROR, "TFRequestItem is NULL\n");
         return AVERROR(EINVAL);
     }
+
+    infer_request = request->infer_request;
+    lltask = request->lltask;
+    task = lltask->task;
+    tf_model = task->model;
 
     TF_SessionRun(tf_model->session, NULL,
                   infer_request->tf_input, &infer_request->input_tensor, 1,
@@ -315,7 +321,7 @@ static int get_output_tf(DNNModel *model, const char *input_name, int input_widt
     int ret;
     TFModel *tf_model = (TFModel *)model;
     DnnContext *ctx = tf_model->ctx;
-    TaskItem task;
+    TaskItem task = { 0 };
     TFRequestItem *request;
     DNNExecBaseParams exec_params = {
         .input_name     = input_name,
@@ -486,6 +492,7 @@ static void dnn_free_model_tf(DNNModel **model)
         return;
 
     tf_model = (TFModel *)(*model);
+    ff_dnn_wait_requests(tf_model->request_queue, tf_model->nb_requests);
     while (ff_safe_queue_size(tf_model->request_queue) != 0) {
         TFRequestItem *item = ff_safe_queue_pop_front(tf_model->request_queue);
         destroy_request_item(&item);
@@ -540,13 +547,6 @@ static DNNModel *dnn_load_model_tf(DnnContext *ctx, DNNFunctionType func_type, A
         ctx->nireq = av_cpu_count() / 2 + 1;
     }
 
-#if !HAVE_PTHREAD_CANCEL
-    if (ctx->options.async) {
-        ctx->options.async = 0;
-        av_log(filter_ctx, AV_LOG_WARNING, "pthread is not supported, roll back to sync.\n");
-    }
-#endif
-
     tf_model->request_queue = ff_safe_queue_create();
     if (!tf_model->request_queue) {
         goto err;
@@ -573,6 +573,7 @@ static DNNModel *dnn_load_model_tf(DnnContext *ctx, DNNFunctionType func_type, A
             destroy_request_item(&item);
             goto err;
         }
+        tf_model->nb_requests++;
     }
 
     tf_model->lltask_queue = ff_queue_create();
@@ -706,6 +707,7 @@ static void infer_completion_callback(void *args) {
     }
 
     for (uint32_t i = 0; i < task->nb_output; ++i) {
+        outputs[i].layout = DL_NHWC;
         outputs[i].dims[dnn_get_height_idx_by_layout(outputs[i].layout)] =
             TF_Dim(infer_request->output_tensors[i], 1);
         outputs[i].dims[dnn_get_width_idx_by_layout(outputs[i].layout)] =

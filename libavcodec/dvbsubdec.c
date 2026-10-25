@@ -999,6 +999,9 @@ static int dvbsub_parse_object_segment(AVCodecContext *avctx,
 
     int coding_method, non_modifying_color;
 
+    if (buf_size < 3)
+        return AVERROR_INVALIDDATA;
+
     object_id = AV_RB16(buf);
     buf += 2;
 
@@ -1011,6 +1014,8 @@ static int dvbsub_parse_object_segment(AVCodecContext *avctx,
     non_modifying_color = ((*buf++) >> 1) & 1;
 
     if (coding_method == 0) {
+        if (buf_end - buf < 4)
+            return AVERROR_INVALIDDATA;
         top_field_len = AV_RB16(buf);
         buf += 2;
         bottom_field_len = AV_RB16(buf);
@@ -1189,7 +1194,7 @@ static int dvbsub_parse_region_segment(AVCodecContext *avctx,
     buf += 2;
 
     ret = av_image_check_size2(region->width, region->height, avctx->max_pixels, AV_PIX_FMT_PAL8, 0, avctx);
-    if (ret >= 0 && region->width * region->height * 2 > 320 * 1024 * 8) {
+    if (ret >= 0 && region->width * region->height > 320 * 1024 * 8 / 2) {
         ret = AVERROR_INVALIDDATA;
         av_log(avctx, AV_LOG_ERROR, "Pixel buffer memory constraint violated\n");
     }
