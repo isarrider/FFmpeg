@@ -1,0 +1,100 @@
+# Runs FFmpeg's regression test suite (FATE) on a branch of this fork, with and
+# without frame threading, next to a control run of master.
+#
+# Fork-only helper: this branch is not meant to be sent upstream.
+name: FATE
+
+on:
+  push:
+    branches: [ci/windows-build]
+    paths: [.github/workflows/fate.yml]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to test
+        default: vc1-frame-threading
+
+permissions:
+  contents: read
+
+jobs:
+  fate:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: branch, 1 thread
+            ref: branch
+            threads: 1
+          - name: branch, 4 frame threads
+            ref: branch
+            threads: 4
+            vc1_stress: true
+          - name: master, 4 frame threads (control)
+            ref: master
+            threads: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref == 'master' && 'master' || inputs.ref || 'vc1-frame-threading' }}
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm rsync
+
+      - name: Restore FATE samples
+        uses: actions/cache@v4
+        with:
+          path: fate-suite
+          key: fate-suite-${{ github.run_id }}
+          restore-keys: fate-suite-
+
+      - name: Configure
+        run: ./configure --samples="$PWD/fate-suite" --disable-doc
+
+      - name: Update FATE samples
+        run: make fate-rsync
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Run FATE
+        run: |
+          set -o pipefail
+          make -k -j"$(nproc)" fate THREADS=${{ matrix.threads }} THREAD_TYPE=frame 2>&1 | tee fate.log | grep -E '^(TEST|make)' | tail -n 40 || true
+          grep -oE '\[[^]]*fate-[^]]*\] Error' fate.log | sed -E 's/.*(fate-[^]]*)\].*/\1/' | sort -u > failed.txt || true
+          passed=$(grep -c '^TEST' fate.log || true)
+          if [ -s failed.txt ]; then
+            echo "::error title=FATE ${{ matrix.name }}: $(wc -l < failed.txt) failed of $passed run::$(tr '\n' ' ' < failed.txt | cut -c1-3000)"
+            exit 1
+          fi
+          echo "::notice title=FATE ${{ matrix.name }}::all $passed tests passed"
+
+      - name: VC-1 tests at 2, 8 and 16 frame threads, 5 times each
+        if: ${{ matrix.vc1_stress && !cancelled() }}
+        run: |
+          fails=0
+          for t in 2 8 16; do
+            for i in 1 2 3 4 5; do
+              make -k fate-vc1 fate-wmv3-drm THREADS=$t THREAD_TYPE=frame > vc1.log 2>&1 || { fails=$((fails+1)); grep -E 'Error|failed' vc1.log | head -5; }
+            done
+          done
+          if [ "$fails" -gt 0 ]; then
+            echo "::error title=VC-1 thread stress::$fails of 15 runs failed"
+            exit 1
+          fi
+          echo "::notice title=VC-1 thread stress::15 of 15 runs passed (2, 8 and 16 threads)"
+
+      - name: Upload logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fate-${{ strategy.job-index }}
+          path: |
+            fate.log
+            failed.txt
+            tests/data/fate/*.err
+          if-no-files-found: ignore
