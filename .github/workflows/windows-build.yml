@@ -1,0 +1,56 @@
+# Cross-compiles a static Windows x64 ffmpeg.exe / ffprobe.exe from a branch of
+# this fork and offers them as a downloadable artifact.
+#
+# Fork-only helper: this branch is not meant to be sent upstream.
+name: Windows x64 build
+
+on:
+  push:
+    branches: [ci/windows-build]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build
+        default: vc1-frame-threading
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'vc1-frame-threading' }}
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64-posix nasm
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          ../configure \
+            --arch=x86_64 --target-os=mingw32 \
+            --cross-prefix=x86_64-w64-mingw32- \
+            --enable-static --disable-shared --extra-ldflags=-static \
+            --pkg-config=false --disable-autodetect \
+            --enable-d3d11va --enable-dxva2 --enable-schannel \
+            --disable-doc --disable-ffplay \
+            --disable-indevs --disable-outdevs \
+            --extra-version="$(git rev-parse --short HEAD)"
+
+      - name: Build
+        run: make -C build -j"$(nproc)" ffmpeg.exe ffprobe.exe
+
+      - name: Strip
+        run: x86_64-w64-mingw32-strip build/ffmpeg.exe build/ffprobe.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-win64-${{ inputs.ref || 'vc1-frame-threading' }}
+          path: |
+            build/ffmpeg.exe
+            build/ffprobe.exe
