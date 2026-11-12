@@ -37,13 +37,14 @@
  * With frame threading, wait until the rows of the reference picture a
  * block can read from have been decoded.
  *
- * @param ref   reference picture, NULL if it is the current picture
- * @param src_y first luma line of the referenced block (chroma lines
- *              doubled), in lines of the current frame or field
+ * @param ref       reference picture, NULL if it is the current picture
+ * @param src_y     first luma line of the referenced block (chroma lines
+ *                  doubled), in lines of the current frame or field
+ * @param ref_field in field pictures, the parity of the referenced field
  */
 static av_always_inline void vc1_await_ref(const VC1Context *v,
                                            const MPVWorkPicture *ref,
-                                           int src_y)
+                                           int src_y, int ref_field)
 {
     const MpegEncContext *s = &v->s;
 
@@ -53,12 +54,11 @@ static av_always_inline void vc1_await_ref(const VC1Context *v,
          *   16x16 luma, bicubic:          src_y - 1 + 18     = src_y + 17
          *   8x8 chroma, bilinear:      2 * (uvsrc_y + 8) + 1 = src_y + 17
          *   8x8 luma of a field MV in an interlaced frame,
-         *   every other line:             src_y - 2 + 2 * 10 = src_y + 18
-         * In field pictures, line n of the bottom field is line 2 * n + 1
-         * of the frame, which the shift below covers as 18 > 17. */
-        int y = FFMAX(src_y + 18, 0) << v->field_mode;
+         *   every other line:             src_y - 2 + 2 * 10 = src_y + 18 */
+        int progress = ff_vc1_ref_progress(s, ref->ptr, src_y + 18,
+                                           v->field_mode ? ref_field : -1);
 
-        ff_thread_progress_await(&ref->ptr->progress, y >> 4);
+        ff_thread_progress_await(&ref->ptr->progress, progress);
     }
 }
 
@@ -306,7 +306,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
         }
     }
 
-    vc1_await_ref(v, ref, FFMAX(src_y, 2 * uvsrc_y));
+    vc1_await_ref(v, ref, FFMAX(src_y, 2 * uvsrc_y), v->ref_field_type[dir]);
 
     srcY += src_y   * s->linesize   + src_x;
     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
@@ -593,7 +593,7 @@ void ff_vc1_mc_4mv_luma(VC1Context *v, int n, int dir, int avg)
             src_y = av_clip(src_y, -18, s->avctx->coded_height + 1);
     }
 
-    vc1_await_ref(v, ref, src_y);
+    vc1_await_ref(v, ref, src_y, v->ref_field_type[dir]);
 
     srcY += src_y * s->linesize + src_x;
     if (v->field_mode && v->ref_field_type[dir])
@@ -769,7 +769,7 @@ void ff_vc1_mc_4mv_chroma(VC1Context *v, int dir)
         return;
     }
 
-    vc1_await_ref(v, ref, 2 * uvsrc_y);
+    vc1_await_ref(v, ref, 2 * uvsrc_y, chroma_ref_type);
 
     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
     srcV += uvsrc_y * s->uvlinesize + uvsrc_x;
@@ -933,14 +933,14 @@ void ff_vc1_mc_4mv_chroma4(VC1Context *v, int dir, int dir2, int avg)
             lutuv  = v->next_lutuv;
             use_ic = v->next_use_ic;
             interlace = v->next_interlaced;
-            vc1_await_ref(v, &s->next_pic, 2 * uvsrc_y);
+            vc1_await_ref(v, &s->next_pic, 2 * uvsrc_y, 0);
         } else {
             srcU = s->last_pic.data[1];
             srcV = s->last_pic.data[2];
             lutuv  = v->last_lutuv;
             use_ic = v->last_use_ic;
             interlace = v->last_interlaced;
-            vc1_await_ref(v, &s->last_pic, 2 * uvsrc_y);
+            vc1_await_ref(v, &s->last_pic, 2 * uvsrc_y, 0);
         }
         if (!srcU)
             return;
@@ -1106,7 +1106,7 @@ void ff_vc1_interp_mc(VC1Context *v)
         }
     }
 
-    vc1_await_ref(v, &s->next_pic, FFMAX(src_y, 2 * uvsrc_y));
+    vc1_await_ref(v, &s->next_pic, FFMAX(src_y, 2 * uvsrc_y), v->ref_field_type[1]);
 
     srcY += src_y   * s->linesize   + src_x;
     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;

@@ -31,6 +31,7 @@
 #include "vc1_common.h"
 #include "vc1dsp.h"
 
+#include "libavutil/frame.h"
 #include "libavutil/mem_internal.h"
 
 #define AC_VLC_BITS 9
@@ -353,6 +354,12 @@ typedef struct VC1Context{
     uint8_t *blk_mv_type_base, *blk_mv_type;    ///< 0: frame MV, 1: field MV (interlaced frame)
     uint8_t *mv_f_base, *mv_f[2];               ///< 0: MV obtained from same field, 1: opposite field
     uint8_t *mv_f_next_base, *mv_f_next[2];
+    /**
+     * RefStruct reference: mv_f of the last field-coded I/P picture. That
+     * picture writes it through mv_f while it is decoded, field B-pictures
+     * read it through mv_f_next. NULL until there has been such a picture.
+     */
+    uint8_t *mv_f_next_buf;
     int field_mode;         ///< 1 for interlaced field pictures
     int fptype;
     int second_field;
@@ -441,6 +448,41 @@ int  ff_vc1_decode_init(AVCodecContext *avctx);
 void ff_vc1_init_transposed_scantables(VC1Context *v);
 int  ff_vc1_decode_end(AVCodecContext *avctx);
 void ff_vc1_decode_blocks(VC1Context *v);
+
+/**
+ * Frame threading: get the progress a reference picture has to report before
+ * one of its lines may be read.
+ *
+ * Frame-coded pictures report the last final MB row. Field-coded pictures
+ * report the last final MB row of the field they decode first, followed by
+ * mb_height / 2 plus the last final MB row of their second field, so that
+ * in both cases the progress also covers the rows of the motion vector
+ * arrays of the picture with that index.
+ *
+ * @param ref   the reference picture
+ * @param line  the last line read
+ * @param field -1 if line is a line of the frame, otherwise the parity of
+ *              the field it is a line of
+ */
+static inline int ff_vc1_ref_progress(const MpegEncContext *s,
+                                      const MPVPicture *ref,
+                                      int line, int field)
+{
+    line = FFMAX(line, 0);
+    if (!ref->field_picture) {
+        return (field < 0 ? line : 2 * line + field) >> 4;
+    } else {
+        int field_mb_height = FFALIGN(s->mb_height, 2) >> 1;
+        int first_field     = !(ref->f->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST);
+
+        if (field < 0)                  // both fields up to this frame line
+            return field_mb_height + (line >> 5);
+        else if (field == first_field)
+            return FFMIN(line >> 4, field_mb_height - 1);
+        else
+            return field_mb_height + (line >> 4);
+    }
+}
 
 void ff_vc1_i_overlap_filter(VC1Context *v);
 void ff_vc1_p_overlap_filter(VC1Context *v);

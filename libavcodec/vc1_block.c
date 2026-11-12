@@ -76,22 +76,27 @@ static inline void update_block_index(MpegEncContext *s)
 /** @} */ //Bitplane group
 
 /**
- * Report the MB rows of a frame-coded reference picture that are final.
+ * Report the MB rows of a reference picture that are final.
  *
  * Called once MB row s->mb_y is decoded. The loop filters trail the decoding
  * loop by two MB rows (see ff_vc1_i_loop_filter(), ff_vc1_p_loop_filter()
  * and ff_vc1_p_intfr_loop_filter()): while row y is decoded, the last edges
  * touching row y - 2 are filtered, and no later row modifies it anymore.
  * Overlap smoothing and the delayed pixel output trail by one row only.
- * Field pictures are only reported as a whole by ff_mpv_frame_end().
+ *
+ * In field pictures, the rows of the second field are counted on from those
+ * of the first, see ff_vc1_ref_progress(). The last rows of the first field
+ * are reported by vc1_decode_frame(), those of the picture by
+ * ff_mpv_frame_end().
  */
 static void vc1_report_decode_progress(VC1Context *v)
 {
     MpegEncContext *s = &v->s;
 
     if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME) &&
-        s->cur_pic.reference && !v->field_mode && !s->er.error_occurred)
-        ff_thread_progress_report(&s->cur_pic.ptr->progress, s->mb_y - 2);
+        s->cur_pic.reference && !s->er.error_occurred)
+        ff_thread_progress_report(&s->cur_pic.ptr->progress,
+                                  s->mb_y - 2 + v->mb_off / s->mb_stride);
 }
 
 static void vc1_put_blocks_clamped(VC1Context *v, int put_signed)
@@ -2892,7 +2897,10 @@ static void vc1_decode_b_blocks(VC1Context *v)
     for (s->mb_y = s->start_mb_y; s->mb_y < s->end_mb_y; s->mb_y++) {
         s->mb_x = 0;
         init_block_index(v);
-        /* direct mode reads the co-located motion of the next anchor */
+        /* Direct mode reads the co-located motion of the next anchor, and
+         * its field MV flags in field pictures. The progress of a picture
+         * also covers this row of its motion arrays, whether it is coded as
+         * a frame or as fields, see ff_vc1_ref_progress(). */
         if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME) &&
             s->next_pic.ptr)
             ff_thread_progress_await(&s->next_pic.ptr->progress,
@@ -2956,7 +2964,9 @@ static void vc1_decode_skip_blocks(VC1Context *v)
         init_block_index(v);
         update_block_index(s);
         if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME))
-            ff_thread_progress_await(&s->last_pic.ptr->progress, s->mb_y);
+            ff_thread_progress_await(&s->last_pic.ptr->progress,
+                                     ff_vc1_ref_progress(s, s->last_pic.ptr,
+                                                         s->mb_y * 16 + 15, -1));
         memcpy(s->dest[0], s->last_pic.data[0] + s->mb_y * 16 * s->linesize,   s->linesize   * 16);
         memcpy(s->dest[1], s->last_pic.data[1] + s->mb_y *  8 * s->uvlinesize, s->uvlinesize *  8);
         memcpy(s->dest[2], s->last_pic.data[2] + s->mb_y *  8 * s->uvlinesize, s->uvlinesize *  8);
