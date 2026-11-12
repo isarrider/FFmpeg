@@ -38,18 +38,20 @@
  *   pictures, intensity compensation and the field MV flags of the last
  *   field-coded anchor. This happens once the previous thread has called
  *   ff_thread_finish_setup(), which vc1_decode_frame() does as early as
- *   possible: right after the picture header for most pictures, after
- *   decoding for those whose later headers can still change that state.
+ *   possible: right after the picture header for most pictures, after the
+ *   header of the second field for field-coded I/P pictures, and after
+ *   decoding if slices repeat the picture header.
  *
- * - Reference pictures report their progress in MB rows of the frame as
- *   they are decoded, trailing the overlap and loop filters (see
- *   vc1_report_decode_progress() in vc1_block.c). Field-coded pictures are
- *   only reported as a whole, by ff_mpv_frame_end().
+ * - Reference pictures report their progress in MB rows as they are
+ *   decoded, trailing the loop filters (see vc1_report_decode_progress() in
+ *   vc1_block.c). Field-coded pictures report the rows of their first
+ *   field, then those of their second field (see ff_vc1_ref_progress()).
  *
  * - Before a block is predicted from a reference picture, the decoding
- *   thread waits until the rows it reads are available (vc1_await_ref() in
- *   vc1_mc.c). The same applies to the rows copied for skipped pictures and
- *   to the co-located motion read by B-picture direct mode (vc1_block.c).
+ *   thread waits until the rows it reads are available, in the field it
+ *   reads them from (vc1_await_ref() in vc1_mc.c). The same applies to the
+ *   rows copied for skipped pictures and to the co-located motion read by
+ *   B-picture direct mode (vc1_block.c).
  */
 
 #include "config_components.h"
@@ -77,6 +79,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
+#include "libavutil/refstruct.h"
 #include "libavutil/thread.h"
 
 
@@ -796,6 +799,7 @@ static av_cold void vc1_decode_reset(AVCodecContext *avctx)
     av_freep(&v->blk_mv_type_base);
     av_freep(&v->mv_f_base);
     av_freep(&v->mv_f_next_base);
+    av_refstruct_unref(&v->mv_f_next_buf);
     av_freep(&v->block);
     av_freep(&v->cbp_base);
     av_freep(&v->ttblk_base);
@@ -811,6 +815,41 @@ av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
 {
     vc1_decode_reset(avctx);
     return ff_mpv_decode_close(avctx);
+}
+
+/**
+ * Set up the field MV flags for the picture about to be decoded.
+ *
+ * A field-coded I/P picture gets a new buffer of its own, which then is also
+ * what the field B-pictures after it (in coding order) predict direct mode
+ * from. With frame threading, those can be decoded by other threads while
+ * this picture still is, so the buffer is shared by reference; what they
+ * read of it is covered by the progress of this picture. All other pictures
+ * only need scratch space for their own flags.
+ */
+static int vc1_setup_mv_f(VC1Context *v)
+{
+    const MpegEncContext *s = &v->s;
+    size_t plane_size = vc1_mv_f_plane_size(s);
+    uint8_t *buf;
+
+    if (v->field_mode && !(v->fptype & 4)) {
+        buf = av_refstruct_allocz(2 * plane_size);
+        if (!buf)
+            return AVERROR(ENOMEM);
+        av_refstruct_unref(&v->mv_f_next_buf);
+        v->mv_f_next_buf = buf;
+    } else {
+        buf = v->mv_f_base;
+    }
+    v->mv_f[0] = buf + s->b8_stride + 1;
+    v->mv_f[1] = v->mv_f[0] + plane_size;
+
+    buf = v->mv_f_next_buf ? v->mv_f_next_buf : v->mv_f_next_base;
+    v->mv_f_next[0] = buf + s->b8_stride + 1;
+    v->mv_f_next[1] = v->mv_f_next[0] + plane_size;
+
+    return 0;
 }
 
 #if HAVE_THREADS
@@ -913,12 +952,8 @@ static int vc1_update_thread_context(AVCodecContext *dst,
     REMAP_PTR(curr_use_ic, last_use_ic,   next_use_ic,   aux_use_ic);
 
     /* Field MV flags of the last field-coded anchor, read by direct-mode
-     * prediction in field B-pictures. Anchors swap them in place only after
-     * decoding, and do not finish setup before that. B-pictures only read
-     * them. */
-    memcpy(v->mv_f_next[0]  - (s->b8_stride  + 1),
-           v1->mv_f_next[0] - (s1->b8_stride + 1),
-           2 * vc1_mv_f_plane_size(s));
+     * prediction in field B-pictures; see vc1_setup_mv_f(). */
+    av_refstruct_replace(&v->mv_f_next_buf, v1->mv_f_next_buf);
 
     return 0;
 }
@@ -957,7 +992,8 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
         int raw_size;
     } *slices = NULL, *tmp;
     unsigned slices_allocated = 0;
-    int frame_started = 0, late_setup;
+    int frame_started = 0;
+    enum { SETUP_NOW, SETUP_SECOND_FIELD, SETUP_END } setup = SETUP_NOW;
 
     v->second_field = 0;
 
@@ -1226,29 +1262,36 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
         s->cur_pic.ptr->f->repeat_pict = v->rptfrm * 2;
     }
 
+    if ((ret = vc1_setup_mv_f(v)) < 0)
+        goto err;
+
     /* Frame threading: let the next picture start decoding in another
-     * thread as soon as everything it depends on is known. That is the case
-     * now, except when the software decoding below can still change it:
+     * thread as soon as everything it depends on is known, that is, what
+     * vc1_update_thread_context() copies. That is the case now, except when
+     * the software decoding below can still change it:
      * - The header of the second field of an I/P field picture can update
-     *   the intensity compensation state, and the field MV flags that
-     *   subsequent field B-pictures predict from are swapped into
-     *   v->mv_f_next only once both fields are decoded.
-     * - Slices can repeat the picture header.
-     * Setup is then finished by the generic code once decoding returns.
-     * Field B-pictures do not have this problem; what their second field
-     * header changes is not used by later pictures (see
-     * vc1_update_thread_context()).
+     *   the intensity compensation of the reference fields, including the
+     *   first field of the picture itself. Setup is finished once that
+     *   header is parsed, see below. Field B-pictures do not have this
+     *   problem; what their second field header changes is not used by
+     *   later pictures.
+     * - Slices can repeat the picture header. Setup is then finished by the
+     *   generic code once decoding returns.
      * Hardware decoding uses none of this state, and requires setup to be
      * finished before the hwaccel is called. */
-    late_setup = v->field_mode && s->pict_type != AV_PICTURE_TYPE_B;
-    for (i = 0; i < n_slices && !late_setup; i++) {
-        /* the first bit after a slice address is the PIC_HEADER_FLAG; field
-         * markers carry a second field header instead, but then late_setup
-         * is either already set or the picture is a B-picture */
-        if (!(v->field_mode && i == n_slices1 + 1))
-            late_setup = show_bits1(&slices[i].gb);
+    setup = SETUP_NOW;
+    if (!avctx->hwaccel) {
+        if (v->field_mode && !(v->fptype & 4))
+            setup = SETUP_SECOND_FIELD;
+        for (i = 0; i < n_slices; i++) {
+            /* the first bit after a slice address is the PIC_HEADER_FLAG;
+             * field markers carry the second field header instead */
+            if (!(v->field_mode && i == n_slices1 + 1) &&
+                show_bits1(&slices[i].gb))
+                setup = SETUP_END;
+        }
     }
-    if (avctx->hwaccel || !late_setup)
+    if (setup == SETUP_NOW)
         ff_thread_finish_setup(avctx);
 
     if (avctx->hwaccel) {
@@ -1442,6 +1485,16 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                             goto err;
                         continue;
                     }
+                    /* The first field is complete, including its last two
+                     * MB rows, which vc1_report_decode_progress() could not
+                     * report. */
+                    if (HAVE_THREADS && s->cur_pic.reference &&
+                        (avctx->active_thread_type & FF_THREAD_FRAME) &&
+                        !s->er.error_occurred)
+                        ff_thread_progress_report(&s->cur_pic.ptr->progress,
+                                                  mb_height - 1);
+                    if (setup == SETUP_SECOND_FIELD)
+                        ff_thread_finish_setup(avctx);
                 } else if (get_bits1(&v->gb)) {
                     v->pic_header_flag = 1;
                     if ((header_ret = ff_vc1_parse_frame_header_adv(v, &v->gb)) < 0) {
@@ -1487,10 +1540,6 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
             s->cur_pic.linesize[2] >>= 1;
             s->linesize                      >>= 1;
             s->uvlinesize                    >>= 1;
-            if (v->s.pict_type != AV_PICTURE_TYPE_BI && v->s.pict_type != AV_PICTURE_TYPE_B) {
-                FFSWAP(uint8_t *, v->mv_f_next[0], v->mv_f[0]);
-                FFSWAP(uint8_t *, v->mv_f_next[1], v->mv_f[1]);
-            }
         }
         ff_dlog(s->avctx, "Consumed %i/%i bits\n",
                 get_bits_count(&v->gb), v->gb.size_in_bits);
