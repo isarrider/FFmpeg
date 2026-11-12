@@ -37,6 +37,17 @@
  * With frame threading, wait until the rows of the reference picture a
  * block can read from have been decoded.
  *
+ *    reference picture (or one field of it)
+ *   ┌────────────────────────────────┐
+ *   │██████ reported rows ███████████│
+ *   │█████████████████┌────────┐█████│ ◀─ src_y (MV already applied)
+ *   │█████████████████│ block  │█████│    block + interpolation taps,
+ *   │█████████████████└────────┘█████│    possibly every other line
+ *   │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│ ◀─ src_y + 18: last line read
+ *   │                                │
+ *   │      still being decoded       │
+ *   └────────────────────────────────┘
+ *
  * @param ref       reference picture, NULL if it is the current picture
  * @param src_y     first luma line of the referenced block (chroma lines
  *                  doubled), in lines of the current frame or field
