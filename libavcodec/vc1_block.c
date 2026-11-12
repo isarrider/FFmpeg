@@ -34,6 +34,7 @@
 #include "threadprogress.h"
 #include "unary.h"
 #include "vc1.h"
+#include "vc1_stats.h"
 #include "vc1_pred.h"
 #include "vc1acdata.h"
 #include "vc1data.h"
@@ -2914,8 +2915,8 @@ static void vc1_decode_b_blocks(VC1Context *v)
          * a frame or as fields, see ff_vc1_ref_progress(). */
         if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME) &&
             s->next_pic.ptr)
-            ff_thread_progress_await(&s->next_pic.ptr->progress,
-                                     s->mb_y + v->mb_off / s->mb_stride);
+            ff_vc1_st_await(&s->next_pic.ptr->progress,
+                            s->mb_y + v->mb_off / s->mb_stride, VC1_ST_WAIT_DIRECT);
         for (; s->mb_x < s->mb_width; s->mb_x++) {
             update_block_index(s);
 
@@ -2976,9 +2977,9 @@ static void vc1_decode_skip_blocks(VC1Context *v)
         update_block_index(s);
         /* a skipped picture is a row-by-row copy of the reference */
         if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME))
-            ff_thread_progress_await(&s->last_pic.ptr->progress,
-                                     ff_vc1_ref_progress(s, s->last_pic.ptr,
-                                                         s->mb_y * 16 + 15, -1));
+            ff_vc1_st_await(&s->last_pic.ptr->progress,
+                            ff_vc1_ref_progress(s, s->last_pic.ptr,
+                                                s->mb_y * 16 + 15, -1), VC1_ST_WAIT_SKIP);
         memcpy(s->dest[0], s->last_pic.data[0] + s->mb_y * 16 * s->linesize,   s->linesize   * 16);
         memcpy(s->dest[1], s->last_pic.data[1] + s->mb_y *  8 * s->uvlinesize, s->uvlinesize *  8);
         memcpy(s->dest[2], s->last_pic.data[2] + s->mb_y *  8 * s->uvlinesize, s->uvlinesize *  8);

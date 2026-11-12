@@ -360,6 +360,9 @@ typedef struct VC1Context{
      * read it through mv_f_next. NULL until there has been such a picture.
      */
     uint8_t *mv_f_next_buf;
+
+    int64_t st_enter;           ///< diagnostic: time vc1_decode_frame() was entered
+    int st_setup_done;          ///< diagnostic: hand-over already accounted for
     int field_mode;         ///< 1 for interlaced field pictures
     int fptype;
     int second_field;

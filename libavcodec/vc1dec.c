@@ -98,6 +98,7 @@
 #include "thread.h"
 #include "threadprogress.h"
 #include "vc1.h"
+#include "vc1_stats.h"
 #include "vc1data.h"
 #include "vc1_vlc_data.h"
 #include "libavutil/attributes.h"
@@ -836,8 +837,12 @@ static av_cold void vc1_decode_reset(AVCodecContext *avctx)
 /**
  * Close a MSS2/VC1/WMV3 decoder
  */
+static void vc1_st_print(const AVCodecContext *avctx);
+
 av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
 {
+    vc1_st_print(avctx);
+
     vc1_decode_reset(avctx);
     return ff_mpv_decode_close(avctx);
 }
@@ -1021,14 +1026,107 @@ static int vc1_update_thread_context(AVCodecContext *dst,
 static void vc1_await_picture(const AVCodecContext *avctx, const MPVPicture *pic)
 {
     if (HAVE_THREADS && (avctx->active_thread_type & FF_THREAD_FRAME))
-        ff_thread_progress_await(&pic->progress, INT_MAX);
+        ff_vc1_st_await(&pic->progress, INT_MAX, VC1_ST_WAIT_OUTPUT);
 }
 
 /** Decode a VC1/WMV3 frame
  * @todo TODO: Handle VC-1 IDUs (Transport level?)
  */
+static atomic_llong vc1_st_first, vc1_st_last;
+static atomic_int   vc1_st_printed;
+
+static int vc1_decode_frame_impl(AVCodecContext *avctx, AVFrame *pict,
+                                 int *got_frame, AVPacket *avpkt);
+
+/* diagnostic wrapper accounting for the time spent per picture */
 static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                             int *got_frame, AVPacket *avpkt)
+{
+    VC1Context *v = avctx->priv_data;
+    long long expected = 0;
+    int64_t t0 = av_gettime_relative(), t1;
+    int ret;
+
+    atomic_compare_exchange_strong(&vc1_st_first, &expected, t0);
+    v->st_enter      = t0;
+    v->st_setup_done = 0;
+    ret = vc1_decode_frame_impl(avctx, pict, got_frame, avpkt);
+    t1 = av_gettime_relative();
+    if (avpkt->size > 0) {
+        ff_vc1_st_add(VC1_ST_TOTAL, t1 - t0);
+        if (!v->st_setup_done)
+            ff_vc1_st_add(VC1_ST_SETUP_END, t1 - t0);
+        ff_vc1_st_add(v->s.pict_type == AV_PICTURE_TYPE_I ? VC1_ST_PIC_I :
+                      v->s.pict_type == AV_PICTURE_TYPE_P ? VC1_ST_PIC_P : VC1_ST_PIC_B, 0);
+        if (v->field_mode)
+            ff_vc1_st_add(VC1_ST_PIC_FIELD, 0);
+    }
+    expected = atomic_load(&vc1_st_last);
+    while (expected < t1 && !atomic_compare_exchange_weak(&vc1_st_last, &expected, t1));
+    return ret;
+}
+
+static void vc1_st_print(const AVCodecContext *avctx)
+{
+#define T(k) (tm[k] / 1e6)
+#define N(k) ((int)cnt[k])
+    long long tm[VC1_ST_NB], cnt[VC1_ST_NB];
+    int    pics;
+    double wall  = (atomic_load(&vc1_st_last) - atomic_load(&vc1_st_first)) / 1e6;
+    double total, wait;
+
+    for (int i = 0; i < VC1_ST_NB; i++) {
+        tm[i]  = atomic_load(&ff_vc1_st_time[i]);
+        cnt[i] = atomic_load(&ff_vc1_st_count[i]);
+    }
+    pics  = N(VC1_ST_TOTAL);
+    total = T(VC1_ST_TOTAL);
+    wait  = T(VC1_ST_WAIT_MC) + T(VC1_ST_WAIT_DIRECT) + T(VC1_ST_WAIT_SKIP) + T(VC1_ST_WAIT_OUTPUT);
+
+    /* Every thread context is closed; print once and start over, so that
+     * e.g. the decoder used for probing the stream does not count. */
+    if (!pics || atomic_exchange(&vc1_st_printed, 1))
+        return;
+    for (int i = 0; i < VC1_ST_NB; i++) {
+        atomic_store(&ff_vc1_st_time[i], 0);
+        atomic_store(&ff_vc1_st_count[i], 0);
+    }
+    atomic_store(&vc1_st_first, 0);
+    atomic_store(&vc1_st_last, 0);
+    atomic_store(&vc1_st_printed, 0);
+    if (pics < 5)
+        return;
+    fprintf(stderr, "[vc1 stats] threads=%d (%s), pictures: %d (I %d, P %d, B %d; %d field-coded)\n",
+            avctx->thread_count, avctx->active_thread_type & FF_THREAD_FRAME ? "frame threading" : "no threading",
+            pics, N(VC1_ST_PIC_I), N(VC1_ST_PIC_P), N(VC1_ST_PIC_B), N(VC1_ST_PIC_FIELD));
+    fprintf(stderr, "[vc1 stats] wall time: %.2f s = %.1f pictures/s, %.2f pictures in flight on average\n",
+            wall, pics / wall, total / wall);
+    fprintf(stderr, "[vc1 stats] thread time: %.2f s = %.2f s working + %.2f s waiting (%.1f%%)\n",
+            total, total - wait, wait, 100 * wait / total);
+    fprintf(stderr, "[vc1 stats]   waiting for reference rows (motion compensation): %7.2f s, blocked %d times\n",
+            T(VC1_ST_WAIT_MC), N(VC1_ST_WAIT_MC));
+    fprintf(stderr, "[vc1 stats]   waiting for co-located motion (B direct mode):    %7.2f s, blocked %d times\n",
+            T(VC1_ST_WAIT_DIRECT), N(VC1_ST_WAIT_DIRECT));
+    fprintf(stderr, "[vc1 stats]   waiting for rows of skipped pictures:             %7.2f s, blocked %d times\n",
+            T(VC1_ST_WAIT_SKIP), N(VC1_ST_WAIT_SKIP));
+    fprintf(stderr, "[vc1 stats]   waiting for a picture before output:              %7.2f s, blocked %d times\n",
+            T(VC1_ST_WAIT_OUTPUT), N(VC1_ST_WAIT_OUTPUT));
+    if (N(VC1_ST_SETUP_NOW))
+        fprintf(stderr, "[vc1 stats] serial part (entry to hand-over at the header): %d pictures, %.3f ms each, %.1f%% of the work -> at most %.0f pictures/s\n",
+                N(VC1_ST_SETUP_NOW), 1e3 * T(VC1_ST_SETUP_NOW) / N(VC1_ST_SETUP_NOW),
+                100 * T(VC1_ST_SETUP_NOW) / (total - wait), N(VC1_ST_SETUP_NOW) / T(VC1_ST_SETUP_NOW));
+    if (N(VC1_ST_SETUP_FIELD))
+        fprintf(stderr, "[vc1 stats] handed over after the second field header: %d pictures, %.3f ms each\n",
+                N(VC1_ST_SETUP_FIELD), 1e3 * T(VC1_ST_SETUP_FIELD) / N(VC1_ST_SETUP_FIELD));
+    if (N(VC1_ST_SETUP_END))
+        fprintf(stderr, "[vc1 stats] handed over only after decoding: %d pictures, %.3f ms each\n",
+                N(VC1_ST_SETUP_END), 1e3 * T(VC1_ST_SETUP_END) / N(VC1_ST_SETUP_END));
+#undef T
+#undef N
+}
+
+static int vc1_decode_frame_impl(AVCodecContext *avctx, AVFrame *pict,
+                                 int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size, n_slices = 0, i, ret;
@@ -1356,8 +1454,11 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                 setup = SETUP_END;
         }
     }
-    if (setup == SETUP_NOW)
+    if (setup == SETUP_NOW) {
+        ff_vc1_st_add(VC1_ST_SETUP_NOW, av_gettime_relative() - v->st_enter);
+        v->st_setup_done = 1;
         ff_thread_finish_setup(avctx);
+    }
 
     if (avctx->hwaccel) {
         const FFHWAccel *hwaccel = ffhwaccel(avctx->hwaccel);
@@ -1558,8 +1659,11 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
                         !s->er.error_occurred)
                         ff_thread_progress_report(&s->cur_pic.ptr->progress,
                                                   mb_height - 1);
-                    if (setup == SETUP_SECOND_FIELD)
+                    if (setup == SETUP_SECOND_FIELD) {
+                        ff_vc1_st_add(VC1_ST_SETUP_FIELD, av_gettime_relative() - v->st_enter);
+                        v->st_setup_done = 1;
                         ff_thread_finish_setup(avctx);
+                    }
                 } else if (get_bits1(&v->gb)) {
                     v->pic_header_flag = 1;
                     if ((header_ret = ff_vc1_parse_frame_header_adv(v, &v->gb)) < 0) {

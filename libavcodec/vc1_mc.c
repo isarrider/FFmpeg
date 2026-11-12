@@ -32,6 +32,10 @@
 #include "mpegvideo.h"
 #include "threadprogress.h"
 #include "vc1.h"
+#include "vc1_stats.h"
+
+atomic_llong ff_vc1_st_time[VC1_ST_NB];
+atomic_llong ff_vc1_st_count[VC1_ST_NB];
 
 /**
  * With frame threading, wait until the rows of the reference picture a
@@ -69,7 +73,7 @@ static av_always_inline void vc1_await_ref(const VC1Context *v,
         int progress = ff_vc1_ref_progress(s, ref->ptr, src_y + 18,
                                            v->field_mode ? ref_field : -1);
 
-        ff_thread_progress_await(&ref->ptr->progress, progress);
+        ff_vc1_st_await(&ref->ptr->progress, progress, VC1_ST_WAIT_MC);
     }
 }
 
