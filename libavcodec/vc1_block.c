@@ -84,6 +84,17 @@ static inline void update_block_index(MpegEncContext *s)
  * touching row y - 2 are filtered, and no later row modifies it anymore.
  * Overlap smoothing and the delayed pixel output trail by one row only.
  *
+ *    MB row
+ *   ┌──────┬──────────────────────────────┐
+ *   │ y-3  │██████████████████████████████│ final
+ *   │ y-2  │██████████████████████████████│ final       ◀─ reported
+ *   │ y-1  │▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│ loop filter not finished
+ *   │ y    │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│ just decoded, not yet output
+ *   └──────┴──────────────────────────────┘
+ *
+ * Nothing is reported once an error occurred, as error concealment may
+ * still change any row.
+ *
  * In field pictures, the rows of the second field are counted on from those
  * of the first, see ff_vc1_ref_progress(). The last rows of the first field
  * are reported by vc1_decode_frame(), those of the picture by
@@ -2963,6 +2974,7 @@ static void vc1_decode_skip_blocks(VC1Context *v)
         s->mb_x = 0;
         init_block_index(v);
         update_block_index(s);
+        /* a skipped picture is a row-by-row copy of the reference */
         if (HAVE_THREADS && (s->avctx->active_thread_type & FF_THREAD_FRAME))
             ff_thread_progress_await(&s->last_pic.ptr->progress,
                                      ff_vc1_ref_progress(s, s->last_pic.ptr,

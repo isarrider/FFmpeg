@@ -459,6 +459,14 @@ void ff_vc1_decode_blocks(VC1Context *v);
  * in both cases the progress also covers the rows of the motion vector
  * arrays of the picture with that index.
  *
+ *    frame-coded, mb_height = 2 * h      field-coded, h MB rows per field
+ *   ┌─────────────────────────┐         ┌─────────────────────────┐
+ *   │ row 0           ◀─ 0    │         │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │ first field,
+ *   │ row 1           ◀─ 1    │         │ ═══════════════════════ │ row r ◀─ r
+ *   │  ...                    │         │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │
+ *   │ row 2 * h - 1   ◀─ 2h-1 │         │ ═══════════════════════ │ second field,
+ *   └─────────────────────────┘         └─────────────────────────┘ row r ◀─ h + r
+ *
  * @param ref   the reference picture
  * @param line  the last line read
  * @param field -1 if line is a line of the frame, otherwise the parity of
