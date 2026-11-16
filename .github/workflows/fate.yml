@@ -2,6 +2,7 @@
 # without frame threading, next to a control run of master.
 #
 # Fork-only helper: this branch is not meant to be sent upstream.
+# Last triggered for: vc1-frame-threading rebased onto upstream master of 2026-11-16.
 name: FATE
 
 on:
